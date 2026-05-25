@@ -130,7 +130,8 @@ def compute_portfolio_history(
     result["total_pnl_twd"] = combined[pnl_cols].sum(axis=1)
     result["pnl_pct"] = result["total_pnl_twd"] / result["total_cost_twd"] * 100
     result["daily_pnl_change"] = result["total_pnl_twd"].diff()
-    result.index = pd.to_datetime(result.index)
+    result.index = pd.to_datetime(result.index).normalize()  # strip tz, keep date only
+    result.index.name = "date"
     result = result.sort_index().tail(days)
 
     return result
