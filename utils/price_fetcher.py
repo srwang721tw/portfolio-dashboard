@@ -16,7 +16,15 @@ _ALL = {**TW_TICKERS, **US_TICKERS}
 
 
 def _yf(symbol: str) -> str:
-    return _ALL.get(symbol, symbol)
+    """Map internal symbol to yfinance symbol.
+    Known symbols use the explicit map; numeric-only codes auto-get .TW suffix.
+    """
+    if symbol in _ALL:
+        return _ALL[symbol]
+    # Auto-detect Taiwan stocks: 4–6 digit codes (e.g. 0050, 006208, 00713)
+    if symbol.isdigit() and 4 <= len(symbol) <= 6:
+        return f"{symbol}.TW"
+    return symbol
 
 
 @st.cache_data(ttl=PRICE_CACHE_TTL, show_spinner=False)
