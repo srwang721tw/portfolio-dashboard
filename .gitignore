@@ -1,0 +1,35 @@
+# Environment
+.env
+*.env
+
+# Sensitive data
+data/users.json
+data/pledge_config.json
+data/portfolio_history.json
+data/*.csv
+!data/sample_*.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
