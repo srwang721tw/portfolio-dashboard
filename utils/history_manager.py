@@ -48,6 +48,11 @@ def save_snapshot(total_value_twd: float, total_pnl_twd: float, pnl_pct: float):
     HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
+    try:
+        from utils.gdrive import upload
+        upload(HISTORY_FILE)
+    except Exception:
+        pass
 
 
 def history_to_dataframe() -> pd.DataFrame:

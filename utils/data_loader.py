@@ -158,6 +158,11 @@ def save_pledge_config(config: Dict):
     PLEDGE_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(PLEDGE_FILE, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
+    try:
+        from utils.gdrive import upload
+        upload(PLEDGE_FILE)
+    except Exception:
+        pass
 
 
 def _sample_tw_holdings() -> List[Dict]:

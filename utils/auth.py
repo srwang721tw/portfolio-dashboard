@@ -14,6 +14,14 @@ import streamlit as st
 from config.settings import USERS_FILE, APP_NAME
 
 
+def _drive_upload(path):
+    try:
+        from utils.gdrive import upload
+        upload(path)
+    except Exception:
+        pass
+
+
 def _hash_password(password: str, salt: str) -> str:
     dk = hashlib.pbkdf2_hmac(
         "sha256",
@@ -59,6 +67,7 @@ def create_user(username: str, password: str, totp_enabled: bool = True) -> Tupl
         "created_at": time.time(),
     }
     save_users(users)
+    _drive_upload(USERS_FILE)
     return True, totp_secret
 
 
@@ -70,6 +79,7 @@ def change_password(username: str, new_password: str) -> bool:
     users[username]["password_hash"] = _hash_password(new_password, salt)
     users[username]["salt"] = salt
     save_users(users)
+    _drive_upload(USERS_FILE)
     return True
 
 
