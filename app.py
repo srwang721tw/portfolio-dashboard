@@ -1,13 +1,13 @@
 import streamlit as st
-import plotly.graph_objects as go
-import plotly.express as px
+import altair as alt
 import pandas as pd
-from datetime import datetime
+import numpy as np
+from datetime import datetime, date
 
 from config.settings import (
     APP_NAME, APP_ICON,
     COLOR_POSITIVE, COLOR_NEGATIVE, COLOR_NEUTRAL, COLOR_WARNING, COLOR_PURPLE,
-    PLOTLY_LAYOUT, PLEDGE_CRITICAL, PLEDGE_WARNING, PLEDGE_SAFE,
+    PLEDGE_CRITICAL, PLEDGE_WARNING, PLEDGE_SAFE,
     TW_TICKERS, US_TICKERS, TW_CSV_FILE, US_CSV_FILE,
 )
 from utils.auth import (
@@ -44,7 +44,6 @@ st.markdown("""
 #MainMenu, footer, header { visibility: hidden; }
 .stDeployButton { display: none; }
 
-/* Tab bar */
 .stTabs [data-baseweb="tab-list"] {
     background: #161B22;
     border-radius: 10px;
@@ -64,10 +63,9 @@ st.markdown("""
     background: #0D1117 !important;
     color: #E6EDF3 !important;
 }
-.stTabs [data-baseweb="tab-highlight"] { display: none; }
-.stTabs [data-baseweb="tab-border"]    { display: none; }
+.stTabs [data-baseweb="tab-highlight"],
+.stTabs [data-baseweb="tab-border"] { display: none; }
 
-/* Metric cards */
 div[data-testid="stMetric"] {
     background: #161B22;
     border: 1px solid #30363D;
@@ -78,62 +76,56 @@ div[data-testid="stMetricLabel"] > div {
     font-size: 0.78rem !important;
     color: #8B949E !important;
 }
-div[data-testid="stMetricValue"] > div {
-    font-size: 1.4rem !important;
-}
+div[data-testid="stMetricValue"] > div { font-size: 1.35rem !important; }
 
-/* Dashboard title bar */
-.dash-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 4px 0 16px 0;
-    border-bottom: 1px solid #30363D;
-    margin-bottom: 16px;
-}
-.dash-title { font-size: 1.4rem; font-weight: 700; color: #E6EDF3; }
-.dash-meta  { font-size: 0.8rem; color: #8B949E; }
-
-/* Section headers */
 .section-title {
-    font-size: 1.0rem;
+    font-size: 0.9rem;
     font-weight: 600;
     color: #E6EDF3;
-    margin: 16px 0 8px 0;
-    padding-left: 4px;
+    margin: 14px 0 6px 0;
+    padding-left: 8px;
     border-left: 3px solid #00C896;
 }
-
-/* Status badges */
-.badge-safe     { color: #00C896; font-weight: 600; }
-.badge-watch    { color: #4A90D9; font-weight: 600; }
-.badge-warn     { color: #FFB74D; font-weight: 600; }
-.badge-critical { color: #FF4B5C; font-weight: 600; }
 </style>
 """, unsafe_allow_html=True)
 
+# ── Altair dark theme ─────────────────────────────────────────────────────────
+_AXIS_CFG = dict(
+    labelColor="#C9D1D9", titleColor="#8B949E",
+    gridColor="#21262D", domainColor="#30363D",
+    tickColor="#30363D", labelFontSize=11, titleFontSize=11,
+)
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def fmt(val: float, prefix="NT$") -> str:
-    if abs(val) >= 1_000_000:
-        return f"{prefix}{val/1_000_000:.2f}M"
-    if abs(val) >= 1_000:
-        return f"{prefix}{val/1_000:.1f}K"
-    return f"{prefix}{val:,.0f}"
-
-
-def dc(val: float) -> str:
-    return "normal" if val >= 0 else "inverse"
-
-
-def plotly_chart(fig, height=None):
+def _render(chart, height: int = None):
     if height:
-        fig.update_layout(height=height)
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+        chart = chart.properties(height=height)
+    st.altair_chart(
+        chart
+        .configure(background="rgba(0,0,0,0)")
+        .configure_view(strokeOpacity=0)
+        .configure_axis(**_AXIS_CFG)
+        .configure_legend(
+            labelColor="#C9D1D9", titleColor="#8B949E",
+            padding=8, cornerRadius=6, strokeColor="#30363D",
+        )
+        .configure_title(color="#E6EDF3", fontSize=13, fontWeight="normal"),
+        use_container_width=True,
+    )
+
+# ── Formatters ────────────────────────────────────────────────────────────────
+def fmt(v: float, prefix="NT$") -> str:
+    if abs(v) >= 1_000_000:
+        return f"{prefix}{v/1_000_000:.2f}M"
+    if abs(v) >= 1_000:
+        return f"{prefix}{v/1_000:.1f}K"
+    return f"{prefix}{v:,.0f}"
+
+def dc(v: float) -> str:
+    return "normal" if v >= 0 else "inverse"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# AUTH SCREENS
+# AUTH
 # ═════════════════════════════════════════════════════════════════════════════
 def show_setup():
     st.markdown("<div style='max-width:480px;margin:60px auto'>", unsafe_allow_html=True)
@@ -163,15 +155,15 @@ def show_setup():
                 st.image(get_totp_qr_bytes(uname, secret), width=200)
             with c2:
                 st.code(secret)
-                st.caption("手動輸入金鑰，或用 Authy / Google Authenticator 掃描")
+                st.caption("手動輸入金鑰，或用 Google Authenticator / Authy 掃描")
             st.warning("請先完成綁定再登入。")
     st.markdown("</div>", unsafe_allow_html=True)
 
 
 def show_login():
     st.markdown("<div style='max-width:420px;margin:80px auto'>", unsafe_allow_html=True)
-    st.markdown(f"<div style='text-align:center;font-size:2rem;margin-bottom:8px'>{APP_ICON}</div>", unsafe_allow_html=True)
-    st.markdown(f"<div style='text-align:center;font-size:1.5rem;font-weight:700;margin-bottom:24px'>{APP_NAME}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div style='text-align:center;font-size:2.5rem'>{APP_ICON}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div style='text-align:center;font-size:1.4rem;font-weight:700;margin-bottom:24px'>{APP_NAME}</div>", unsafe_allow_html=True)
     with st.form("login"):
         uname = st.text_input("帳號", placeholder="Username")
         pw    = st.text_input("密碼", type="password", placeholder="Password")
@@ -192,10 +184,193 @@ def show_login():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# CHARTS
+# ═════════════════════════════════════════════════════════════════════════════
+PALETTE = [COLOR_POSITIVE, COLOR_NEUTRAL, COLOR_PURPLE, COLOR_WARNING, COLOR_NEGATIVE]
+
+
+def _chart_alloc(all_enriched):
+    rows = [{"標的": h["name"], "市值": h["market_value_twd"] or 0}
+            for h in all_enriched if (h["market_value_twd"] or 0) > 0]
+    if not rows:
+        return None
+    df = pd.DataFrame(rows)
+    n = len(df)
+    chart = alt.Chart(df).mark_arc(innerRadius=48, padAngle=0.02).encode(
+        theta=alt.Theta("市值:Q", stack=True),
+        color=alt.Color("標的:N",
+                        scale=alt.Scale(range=PALETTE[:n]),
+                        legend=alt.Legend(title=None, orient="right")),
+        tooltip=[alt.Tooltip("標的:N"), alt.Tooltip("市值:Q", format=",.0f", title="NT$")],
+    ).properties(height=260, title="持股配置")
+    return chart
+
+
+def _chart_split(tw_val, us_val):
+    df = pd.DataFrame({"市場": ["🇹🇼 台股", "🇺🇸 美股"], "市值": [tw_val, us_val]})
+    chart = alt.Chart(df).mark_arc(innerRadius=60, padAngle=0.03).encode(
+        theta=alt.Theta("市值:Q", stack=True),
+        color=alt.Color("市場:N",
+                        scale=alt.Scale(range=[COLOR_NEUTRAL, COLOR_PURPLE]),
+                        legend=alt.Legend(title=None, orient="bottom")),
+        tooltip=[alt.Tooltip("市場:N"), alt.Tooltip("市值:Q", format=",.0f", title="NT$")],
+    ).properties(height=260, title="台股 / 美股")
+    return chart
+
+
+def _chart_pnl_bar(all_enriched):
+    rows = [{"標的": h["name"], "損益": h["unrealized_pnl_twd"] or 0}
+            for h in all_enriched]
+    df = pd.DataFrame(rows).sort_values("損益")
+    df["color"] = df["損益"].apply(lambda x: COLOR_POSITIVE if x >= 0 else COLOR_NEGATIVE)
+    chart = (
+        alt.Chart(df).mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3,
+                                cornerRadiusBottomLeft=3, cornerRadiusBottomRight=3).encode(
+            x=alt.X("標的:N", sort=None, title=None,
+                    axis=alt.Axis(labelAngle=-30, labelColor="#C9D1D9")),
+            y=alt.Y("損益:Q", title="NT$"),
+            color=alt.Color("color:N", scale=None, legend=None),
+            tooltip=[alt.Tooltip("標的:N"), alt.Tooltip("損益:Q", format="+,.0f", title="NT$")],
+        )
+        + alt.Chart(pd.DataFrame([{"y": 0}])).mark_rule(
+            color="rgba(255,255,255,0.2)", strokeDash=[4, 4]
+        ).encode(y="y:Q")
+    ).properties(height=260, title="各標的損益")
+    return chart
+
+
+def _chart_snapshot(df_snap):
+    df = df_snap.reset_index()[["date", "total_pnl_twd"]].rename(
+        columns={"total_pnl_twd": "損益"}
+    )
+    lc = COLOR_POSITIVE if df["損益"].iloc[-1] >= 0 else COLOR_NEGATIVE
+    base = alt.Chart(df).encode(x=alt.X("date:T", title=None))
+    area = base.mark_area(color=lc, opacity=0.1).encode(y=alt.Y("損益:Q", title="NT$"))
+    line = base.mark_line(color=lc, strokeWidth=2).encode(y="損益:Q")
+    zero = alt.Chart(pd.DataFrame([{"y": 0}])).mark_rule(
+        color="rgba(255,255,255,0.2)", strokeDash=[4, 4]
+    ).encode(y="y:Q")
+    return (area + line + zero).properties(height=200, title="損益快照")
+
+
+def _chart_price(hist: pd.DataFrame, sym: str, cost_price=None,
+                 line_color=COLOR_NEUTRAL, prefix="NT$"):
+    if hist.empty:
+        return None
+    df = hist.reset_index()
+    df.columns = ["date", "price"]
+    base = alt.Chart(df).encode(x=alt.X("date:T", title=None))
+    area = base.mark_area(color=line_color, opacity=0.08).encode(
+        y=alt.Y("price:Q", title=prefix)
+    )
+    line = base.mark_line(color=line_color, strokeWidth=2).encode(y="price:Q")
+    layers = [area, line]
+    if cost_price:
+        rule = alt.Chart(pd.DataFrame([{"c": cost_price}])).mark_rule(
+            color="#FFB74D", strokeDash=[6, 4], strokeWidth=1.5
+        ).encode(y=alt.Y("c:Q", title=None),
+                 tooltip=alt.Tooltip("c:Q", format=".2f", title="成本"))
+        layers.append(rule)
+    return alt.layer(*layers).properties(height=300)
+
+
+def _chart_pnl_trend(df):
+    data = df.reset_index()[["date", "total_pnl_twd", "total_value_twd"]].rename(
+        columns={"total_pnl_twd": "損益", "total_value_twd": "市值"}
+    )
+    lc = COLOR_POSITIVE if data["損益"].iloc[-1] >= 0 else COLOR_NEGATIVE
+
+    pnl_area = alt.Chart(data).mark_area(color=lc, opacity=0.12).encode(
+        x=alt.X("date:T", title=None),
+        y=alt.Y("損益:Q", title="未實現損益 NT$", axis=alt.Axis(titleColor=lc, labelColor=lc)),
+    )
+    pnl_line = alt.Chart(data).mark_line(color=lc, strokeWidth=2.5).encode(
+        x="date:T", y="損益:Q"
+    )
+    zero = alt.Chart(pd.DataFrame([{"y": 0}])).mark_rule(
+        color="rgba(255,255,255,0.2)", strokeDash=[4, 4]
+    ).encode(y="y:Q")
+    val_line = alt.Chart(data).mark_line(
+        color=COLOR_NEUTRAL, strokeWidth=1.5, strokeDash=[5, 5], opacity=0.6
+    ).encode(
+        x="date:T",
+        y=alt.Y("市值:Q", title="總市值 NT$",
+                axis=alt.Axis(titleColor=COLOR_NEUTRAL, labelColor=COLOR_NEUTRAL)),
+    )
+    return (
+        alt.layer(pnl_area, pnl_line, zero, val_line)
+        .resolve_scale(y="independent")
+        .properties(height=360, title="損益 & 市值趨勢")
+    )
+
+
+def _chart_daily_bar(daily: pd.Series, title="每日損益變化"):
+    df = daily.reset_index()
+    df.columns = ["date", "pnl"]
+    df["color"] = df["pnl"].apply(lambda x: COLOR_POSITIVE if x >= 0 else COLOR_NEGATIVE)
+    bar = alt.Chart(df).mark_bar(width={"band": 0.8}).encode(
+        x=alt.X("date:T", title=None),
+        y=alt.Y("pnl:Q", title="NT$"),
+        color=alt.Color("color:N", scale=None, legend=None),
+        tooltip=[alt.Tooltip("date:T", format="%Y-%m-%d"), alt.Tooltip("pnl:Q", format="+,.0f")],
+    )
+    zero = alt.Chart(pd.DataFrame([{"y": 0}])).mark_rule(
+        color="rgba(255,255,255,0.2)"
+    ).encode(y="y:Q")
+    return (bar + zero).properties(height=260, title=title)
+
+
+def _chart_pledge_gauge(ratio: float):
+    max_v = 500
+    zones = pd.DataFrame([
+        {"x": 0,   "x2": PLEDGE_CRITICAL,              "color": COLOR_NEGATIVE, "zone": f"追繳 < {PLEDGE_CRITICAL}%"},
+        {"x": PLEDGE_CRITICAL, "x2": PLEDGE_WARNING,   "color": COLOR_WARNING,  "zone": f"警戒 {PLEDGE_CRITICAL}~{PLEDGE_WARNING}%"},
+        {"x": PLEDGE_WARNING,  "x2": PLEDGE_SAFE,      "color": COLOR_NEUTRAL,  "zone": f"觀察 {PLEDGE_WARNING}~{PLEDGE_SAFE}%"},
+        {"x": PLEDGE_SAFE,     "x2": max_v,            "color": COLOR_POSITIVE, "zone": f"安全 ≥ {PLEDGE_SAFE}%"},
+    ])
+    scale = alt.Scale(domain=[0, max_v])
+    bg = alt.Chart(zones).mark_bar(height=44, opacity=0.45).encode(
+        x=alt.X("x:Q", scale=scale, title="維持率 %"),
+        x2="x2:Q",
+        color=alt.Color("color:N", scale=None, legend=None),
+        tooltip="zone:N",
+    )
+    val_df = pd.DataFrame([{"r": min(ratio, max_v)}])
+    needle = alt.Chart(val_df).mark_rule(color="white", strokeWidth=3).encode(
+        x=alt.X("r:Q", scale=scale)
+    )
+    label = alt.Chart(val_df).mark_text(dy=-36, fontSize=22, fontWeight="bold", color="white").encode(
+        x=alt.X("r:Q", scale=scale),
+        text=alt.Text("r:Q", format=".1f"),
+    )
+    return (bg + needle + label).properties(height=100)
+
+
+def _chart_ratio_history(ratio_pct: pd.Series):
+    df = ratio_pct.reset_index()
+    df.columns = ["date", "ratio"]
+    line = alt.Chart(df).mark_line(color=COLOR_NEUTRAL, strokeWidth=2).encode(
+        x=alt.X("date:T", title=None),
+        y=alt.Y("ratio:Q", title="維持率 %"),
+        tooltip=[alt.Tooltip("date:T", format="%Y-%m-%d"), alt.Tooltip("ratio:Q", format=".1f")],
+    )
+    rules_df = pd.DataFrame([
+        {"y": PLEDGE_CRITICAL, "color": COLOR_NEGATIVE, "lbl": f"追繳 {PLEDGE_CRITICAL}%"},
+        {"y": PLEDGE_WARNING,  "color": COLOR_WARNING,  "lbl": f"警戒 {PLEDGE_WARNING}%"},
+        {"y": PLEDGE_SAFE,     "color": COLOR_POSITIVE, "lbl": f"安全 {PLEDGE_SAFE}%"},
+    ])
+    rules = alt.Chart(rules_df).mark_rule(strokeDash=[6, 4]).encode(
+        y="y:Q",
+        color=alt.Color("color:N", scale=None, legend=None),
+        tooltip="lbl:N",
+    )
+    return (line + rules).properties(height=260, title="近 90 天維持率趨勢")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # DASHBOARD
 # ═════════════════════════════════════════════════════════════════════════════
 def render_dashboard():
-    # ── Google Drive sync (once per session) ─────────────────────────────────
     if not st.session_state.get("_gdrive_synced"):
         try:
             from utils.gdrive import sync_down_all
@@ -204,7 +379,6 @@ def render_dashboard():
             pass
         st.session_state._gdrive_synced = True
 
-    # ── Load all market data ──────────────────────────────────────────────────
     tw_holdings = load_tw_holdings()
     us_holdings = load_us_holdings()
     all_syms    = tuple(h["symbol"] for h in tw_holdings + us_holdings)
@@ -217,7 +391,6 @@ def render_dashboard():
     us_enriched = enrich_holdings(us_holdings, prices, usd_twd)
     summary     = portfolio_summary(tw_enriched, us_enriched)
 
-    # Save snapshot silently
     if summary["total_value_twd"] > 0:
         save_snapshot(summary["total_value_twd"], summary["total_pnl_twd"], summary["pnl_pct"])
 
@@ -226,62 +399,47 @@ def render_dashboard():
     pnl_30d = get_pnl_change(30)
     now_str = datetime.now().strftime("%Y/%m/%d %H:%M")
 
-    # ── Header bar ────────────────────────────────────────────────────────────
-    h1, h2 = st.columns([4, 1])
+    # ── Header ────────────────────────────────────────────────────────────────
+    h1, h2 = st.columns([5, 1])
     with h1:
         st.markdown(
-            f"<div class='dash-title'>{APP_ICON} {APP_NAME}</div>"
-            f"<div class='dash-meta'>更新：{now_str}　USD/TWD：{usd_twd:.2f}</div>",
+            f"<div style='font-size:1.4rem;font-weight:700'>{APP_ICON} {APP_NAME}</div>"
+            f"<div style='font-size:0.78rem;color:#8B949E'>更新：{now_str}　USD/TWD：{usd_twd:.2f}</div>",
             unsafe_allow_html=True,
         )
     with h2:
-        st.markdown("<div style='text-align:right'>", unsafe_allow_html=True)
-        if st.button("⟳ 更新", use_container_width=True):
+        if st.button("⟳", use_container_width=True, help="重新整理價格"):
             st.cache_data.clear(); st.rerun()
         st.caption(f"👤 {st.session_state.username}")
         if st.button("登出", use_container_width=True):
             logout(); st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("<div style='border-bottom:1px solid #30363D;margin-bottom:12px'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='border-bottom:1px solid #30363D;margin:8px 0 12px 0'></div>",
+                unsafe_allow_html=True)
 
-    # ── KPI Row ───────────────────────────────────────────────────────────────
+    # ── KPIs ──────────────────────────────────────────────────────────────────
     pnl = summary["total_pnl_twd"]
     k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("總市值",   fmt(summary["total_value_twd"]))
-    k2.metric("未實現損益", fmt(pnl),
-              f"{summary['pnl_pct']:+.2f}%", delta_color=dc(pnl))
-    k3.metric("今日損益",
-              fmt(pnl_1d) if pnl_1d is not None else "—",
-              delta_color=dc(pnl_1d or 0))
-    k4.metric("近 7 日損益",
-              fmt(pnl_7d) if pnl_7d is not None else "—",
-              delta_color=dc(pnl_7d or 0))
-    k5.metric("近 30 日損益",
-              fmt(pnl_30d) if pnl_30d is not None else "—",
+    k1.metric("總市值",      fmt(summary["total_value_twd"]))
+    k2.metric("未實現損益",   fmt(pnl), f"{summary['pnl_pct']:+.2f}%", delta_color=dc(pnl))
+    k3.metric("今日損益",     fmt(pnl_1d)  if pnl_1d  is not None else "—",
+              delta_color=dc(pnl_1d  or 0))
+    k4.metric("近 7 日損益",  fmt(pnl_7d)  if pnl_7d  is not None else "—",
+              delta_color=dc(pnl_7d  or 0))
+    k5.metric("近 30 日損益", fmt(pnl_30d) if pnl_30d is not None else "—",
               delta_color=dc(pnl_30d or 0))
 
-    st.markdown("<div style='margin-top:12px'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "📊 總覽", "🇹🇼 台股", "🇺🇸 美股", "📈 損益歷史", "🏦 質押監控"
     ])
-
-    with tab1:
-        _tab_overview(tw_enriched, us_enriched, summary)
-
-    with tab2:
-        _tab_tw(tw_holdings, tw_enriched, prices)
-
-    with tab3:
-        _tab_us(us_holdings, us_enriched, prices, usd_twd)
-
-    with tab4:
-        _tab_history(tw_holdings, us_holdings)
-
-    with tab5:
-        _tab_pledge(prices, usd_twd)
+    with tab1: _tab_overview(tw_enriched, us_enriched, summary)
+    with tab2: _tab_tw(tw_holdings, tw_enriched)
+    with tab3: _tab_us(us_holdings, us_enriched, usd_twd)
+    with tab4: _tab_history(tw_holdings, us_holdings)
+    with tab5: _tab_pledge(prices, usd_twd)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -290,104 +448,41 @@ def render_dashboard():
 def _tab_overview(tw_enriched, us_enriched, summary):
     all_enriched = tw_enriched + us_enriched
 
-    c1, c2, c3 = st.columns([5, 4, 5])
-
-    # Allocation donut
+    c1, c2, c3 = st.columns(3)
     with c1:
-        st.markdown("<div class='section-title'>持股配置</div>", unsafe_allow_html=True)
-        alloc = [
-            {"標的": h["name"], "市值": h["market_value_twd"] or 0}
-            for h in all_enriched if (h["market_value_twd"] or 0) > 0
-        ]
-        if alloc:
-            fig = px.pie(
-                pd.DataFrame(alloc), names="標的", values="市值", hole=0.45,
-                color_discrete_sequence=["#00C896","#4A90D9","#A855F7","#FFB74D","#FF4B5C"],
-            )
-            fig.update_layout(**PLOTLY_LAYOUT, showlegend=True,
-                               legend=dict(orientation="v", x=1.0, font_size=11))
-            fig.update_traces(textinfo="percent", textfont_size=11)
-            plotly_chart(fig, height=260)
-
-    # TW/US split
+        ch = _chart_alloc(all_enriched)
+        if ch: _render(ch)
     with c2:
-        st.markdown("<div class='section-title'>台股 / 美股</div>", unsafe_allow_html=True)
-        tw_v, us_v = summary["tw_value_twd"], summary["us_value_twd"]
-        total_v = tw_v + us_v
-        if total_v > 0:
-            fig2 = go.Figure(go.Pie(
-                labels=["🇹🇼 台股", "🇺🇸 美股"],
-                values=[tw_v, us_v], hole=0.55,
-                marker_colors=[COLOR_NEUTRAL, COLOR_PURPLE],
-                textinfo="label+percent", textfont_size=12,
-            ))
-            fig2.update_layout(
-                **PLOTLY_LAYOUT, showlegend=False,
-                annotations=[dict(
-                    text=f"{fmt(total_v)}", x=0.5, y=0.5,
-                    font_size=12, showarrow=False, font_color="#E6EDF3",
-                )],
-            )
-            plotly_chart(fig2, height=260)
-
-    # P&L bar by stock
+        _render(_chart_split(summary["tw_value_twd"], summary["us_value_twd"]))
     with c3:
-        st.markdown("<div class='section-title'>各標的損益</div>", unsafe_allow_html=True)
-        rows = [
-            {"標的": h["name"], "損益": h["unrealized_pnl_twd"] or 0}
-            for h in all_enriched
-        ]
-        df = pd.DataFrame(rows).sort_values("損益")
-        colors = [COLOR_POSITIVE if v >= 0 else COLOR_NEGATIVE for v in df["損益"]]
-        fig3 = go.Figure(go.Bar(
-            x=df["標的"], y=df["損益"],
-            marker_color=colors,
-            text=[fmt(v) for v in df["損益"]], textposition="outside", textfont_size=10,
-        ))
-        fig3.update_layout(**PLOTLY_LAYOUT, yaxis_title="TWD")
-        plotly_chart(fig3, height=260)
+        _render(_chart_pnl_bar(all_enriched))
 
-    # Holdings table
     st.markdown("<div class='section-title'>完整持倉</div>", unsafe_allow_html=True)
-    rows = []
-    for h in all_enriched:
-        rows.append({
-            "市場":    "🇹🇼 台股" if h["currency"] == "TWD" else "🇺🇸 美股",
-            "代號":    h["symbol"],
-            "名稱":    h["name"],
-            "股數":    h["shares"],
-            "成本均價": f"{h['cost_per_share']:.2f}",
-            "現價":    f"{h['current_price']:.2f}" if h["current_price"] else "—",
-            "成本":    f"{h['cost_basis']:,.0f}",
-            "市值":    f"{h['market_value']:,.0f}" if h["market_value"] else "—",
-            "損益":    f"{h['unrealized_pnl']:+,.0f}" if h["unrealized_pnl"] is not None else "—",
-            "損益率":  f"{h['pnl_pct']:+.2f}%" if h["pnl_pct"] is not None else "—",
-            "幣別":    h["currency"],
-        })
+    rows = [{
+        "市場":    "🇹🇼 台股" if h["currency"] == "TWD" else "🇺🇸 美股",
+        "代號":    h["symbol"],
+        "名稱":    h["name"],
+        "股數":    h["shares"],
+        "成本均價": f"{h['cost_per_share']:.2f}",
+        "現價":    f"{h['current_price']:.2f}" if h["current_price"] else "—",
+        "成本":    f"{h['cost_basis']:,.0f}",
+        "市值":    f"{h['market_value']:,.0f}" if h["market_value"] else "—",
+        "損益":    f"{h['unrealized_pnl']:+,.0f}" if h["unrealized_pnl"] is not None else "—",
+        "損益率":  f"{h['pnl_pct']:+.2f}%" if h["pnl_pct"] is not None else "—",
+        "幣別":    h["currency"],
+    } for h in all_enriched]
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    # Snapshot P&L trend
     df_snap = history_to_dataframe()
     if not df_snap.empty and len(df_snap) > 1:
-        st.markdown("<div class='section-title'>損益歷史快照</div>", unsafe_allow_html=True)
-        last_pnl = df_snap["total_pnl_twd"].iloc[-1]
-        lc = COLOR_POSITIVE if last_pnl >= 0 else COLOR_NEGATIVE
-        fc = "rgba(0,200,150,0.1)" if last_pnl >= 0 else "rgba(255,75,92,0.1)"
-        fig4 = go.Figure(go.Scatter(
-            x=df_snap.index, y=df_snap["total_pnl_twd"],
-            mode="lines", line=dict(color=lc, width=2),
-            fill="tozeroy", fillcolor=fc,
-        ))
-        fig4.add_hline(y=0, line_color="rgba(255,255,255,0.25)", line_dash="dash")
-        fig4.update_layout(**PLOTLY_LAYOUT, yaxis_title="NT$")
-        plotly_chart(fig4, height=200)
+        st.markdown("<div class='section-title'>損益快照趨勢</div>", unsafe_allow_html=True)
+        _render(_chart_snapshot(df_snap))
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # TAB 2 — 台股
 # ═════════════════════════════════════════════════════════════════════════════
-def _tab_tw(tw_holdings, tw_enriched, prices):
-    # Upload section
+def _tab_tw(tw_holdings, tw_enriched):
     with st.expander("📂 上傳國泰證券台股 CSV"):
         st.caption("欄位：股票代號、股票名稱、庫存股數、平均成本、成本金額")
         up = st.file_uploader("選擇 CSV", type=["csv"], key="up_tw")
@@ -400,23 +495,20 @@ def _tab_tw(tw_holdings, tw_enriched, prices):
                 pass
             st.success("上傳成功！"); st.cache_data.clear(); st.rerun()
 
-    # Metrics
-    total_cost  = sum(h["cost_basis"]         for h in tw_enriched)
-    total_value = sum(h["market_value"] or 0  for h in tw_enriched)
+    total_cost  = sum(h["cost_basis"] for h in tw_enriched)
+    total_value = sum(h["market_value"] or 0 for h in tw_enriched)
     total_pnl   = sum(h["unrealized_pnl"] or 0 for h in tw_enriched)
     pnl_pct     = total_pnl / total_cost * 100 if total_cost > 0 else 0
 
     m1, m2, m3 = st.columns(3)
-    m1.metric("台股成本",  f"NT${total_cost:,.0f}")
-    m2.metric("台股市值",  f"NT${total_value:,.0f}",
+    m1.metric("台股成本", f"NT${total_cost:,.0f}")
+    m2.metric("台股市值", f"NT${total_value:,.0f}",
               f"NT${total_pnl:+,.0f} ({pnl_pct:+.2f}%)", delta_color=dc(total_pnl))
-    m3.metric("持股數",    f"{len(tw_enriched)} 檔")
+    m3.metric("持股數",   f"{len(tw_enriched)} 檔")
 
-    # Table
     st.markdown("<div class='section-title'>持倉明細</div>", unsafe_allow_html=True)
     rows = [{
-        "代號": h["symbol"], "名稱": h["name"],
-        "庫存": h["shares"],
+        "代號": h["symbol"], "名稱": h["name"], "庫存": h["shares"],
         "成本均價": f"NT${h['cost_per_share']:.2f}",
         "現價":     f"NT${h['current_price']:.2f}" if h["current_price"] else "—",
         "成本金額": f"NT${h['cost_basis']:,.0f}",
@@ -426,24 +518,32 @@ def _tab_tw(tw_holdings, tw_enriched, prices):
     } for h in tw_enriched]
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    # Price history
     st.markdown("<div class='section-title'>個股走勢</div>", unsafe_allow_html=True)
-    ca, cb = st.columns([2, 1])
-    with ca:
-        sel = st.selectbox("股票", [f"{h['symbol']} {h['name']}" for h in tw_enriched], key="tw_sel")
-    with cb:
-        period = st.radio("期間", ["3M", "6M", "1Y"], horizontal=True, key="tw_period")
-    sym  = sel.split()[0]
-    days = {"3M": 90, "6M": 180, "1Y": 365}[period]
-    hist = fetch_historical_prices(sym, days)
-    h_obj = next((h for h in tw_enriched if h["symbol"] == sym), None)
-    _price_chart(hist, sym, h_obj, prefix="NT$")
+    ca, cb = st.columns([3, 1])
+    sel    = ca.selectbox("股票", [f"{h['symbol']} {h['name']}" for h in tw_enriched], key="tw_sel")
+    period = cb.radio("期間", ["3M","6M","1Y"], horizontal=True, key="tw_per")
+    sym    = sel.split()[0]
+    days   = {"3M":90,"6M":180,"1Y":365}[period]
+    hist   = fetch_historical_prices(sym, days)
+    h_obj  = next((h for h in tw_enriched if h["symbol"] == sym), None)
+    cost_p = h_obj["cost_per_share"] if h_obj else None
+    ch     = _chart_price(hist, sym, cost_p, COLOR_NEUTRAL, "NT$")
+    if ch:
+        _render(ch)
+        s = hist[sym].dropna()
+        sc1, sc2, sc3 = st.columns(3)
+        chg = s.iloc[-1] - s.iloc[0]; chg_pct = chg / s.iloc[0] * 100
+        sc1.metric("期初價", f"NT${s.iloc[0]:.2f}")
+        sc2.metric("現價",   f"NT${s.iloc[-1]:.2f}")
+        sc3.metric("期間漲跌", f"NT${chg:+.2f} ({chg_pct:+.2f}%)", delta_color=dc(chg))
+    else:
+        st.warning(f"無法取得 {sym} 歷史價格")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # TAB 3 — 美股
 # ═════════════════════════════════════════════════════════════════════════════
-def _tab_us(us_holdings, us_enriched, prices, usd_twd):
+def _tab_us(us_holdings, us_enriched, usd_twd):
     with st.expander("📂 上傳國泰證券美股 CSV"):
         st.caption("欄位：Symbol、Name、Shares、Avg Cost (USD)、Total Cost (USD)")
         up = st.file_uploader("選擇 CSV", type=["csv"], key="up_us")
@@ -456,8 +556,8 @@ def _tab_us(us_holdings, us_enriched, prices, usd_twd):
                 pass
             st.success("上傳成功！"); st.cache_data.clear(); st.rerun()
 
-    total_cost_usd  = sum(h["cost_basis"]          for h in us_enriched)
-    total_value_usd = sum(h["market_value"] or 0   for h in us_enriched)
+    total_cost_usd  = sum(h["cost_basis"] for h in us_enriched)
+    total_value_usd = sum(h["market_value"] or 0 for h in us_enriched)
     total_pnl_usd   = sum(h["unrealized_pnl"] or 0 for h in us_enriched)
     pnl_pct         = total_pnl_usd / total_cost_usd * 100 if total_cost_usd > 0 else 0
 
@@ -470,8 +570,7 @@ def _tab_us(us_holdings, us_enriched, prices, usd_twd):
 
     st.markdown("<div class='section-title'>持倉明細</div>", unsafe_allow_html=True)
     rows = [{
-        "代號": h["symbol"], "名稱": h["name"],
-        "股數": h["shares"],
+        "代號": h["symbol"], "名稱": h["name"], "股數": h["shares"],
         "成本均價": f"${h['cost_per_share']:.2f}",
         "現價":     f"${h['current_price']:.2f}" if h["current_price"] else "—",
         "成本(USD)": f"${h['cost_basis']:,.2f}",
@@ -483,55 +582,35 @@ def _tab_us(us_holdings, us_enriched, prices, usd_twd):
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     st.markdown("<div class='section-title'>個股走勢</div>", unsafe_allow_html=True)
-    ca, cb = st.columns([2, 1])
-    with ca:
-        sel = st.selectbox("股票", [f"{h['symbol']} {h['name']}" for h in us_enriched], key="us_sel")
-    with cb:
-        period = st.radio("期間", ["3M", "6M", "1Y", "2Y"], horizontal=True, key="us_period")
-    sym  = sel.split()[0]
-    days = {"3M": 90, "6M": 180, "1Y": 365, "2Y": 730}[period]
-    hist = fetch_historical_prices(sym, days)
-    h_obj = next((h for h in us_enriched if h["symbol"] == sym), None)
-    _price_chart(hist, sym, h_obj, prefix="$", line_color=COLOR_PURPLE)
-
-
-def _price_chart(hist: pd.DataFrame, sym: str, holding, prefix="NT$", line_color=COLOR_NEUTRAL):
-    if hist.empty:
-        st.warning(f"無法取得 {sym} 歷史價格"); return
-    s = hist[sym].dropna()
-    start_p, end_p = s.iloc[0], s.iloc[-1]
-    chg, chg_pct   = end_p - start_p, (end_p - start_p) / start_p * 100
-    cost_p = holding["cost_per_share"] if holding else None
-
-    fig = go.Figure(go.Scatter(
-        x=s.index, y=s.values, mode="lines",
-        line=dict(color=line_color, width=2),
-        fill="tozeroy",
-        fillcolor=f"rgba({int(line_color[1:3],16)},{int(line_color[3:5],16)},{int(line_color[5:7],16)},0.08)",
-    ))
-    if cost_p:
-        fig.add_hline(y=cost_p, line_dash="dash", line_color="#FFB74D",
-                      annotation_text=f"成本 {prefix}{cost_p:.2f}",
-                      annotation_position="bottom right")
-    fig.update_layout(**PLOTLY_LAYOUT, yaxis_title=f"{prefix}", height=300)
-    plotly_chart(fig)
-
-    sc1, sc2, sc3 = st.columns(3)
-    sc1.metric("期初", f"{prefix}{start_p:.2f}")
-    sc2.metric("現價", f"{prefix}{end_p:.2f}")
-    sc3.metric("期間漲跌", f"{prefix}{chg:+.2f} ({chg_pct:+.2f}%)", delta_color=dc(chg))
+    ca, cb = st.columns([3, 1])
+    sel    = ca.selectbox("股票", [f"{h['symbol']} {h['name']}" for h in us_enriched], key="us_sel")
+    period = cb.radio("期間", ["3M","6M","1Y","2Y"], horizontal=True, key="us_per")
+    sym    = sel.split()[0]
+    days   = {"3M":90,"6M":180,"1Y":365,"2Y":730}[period]
+    hist   = fetch_historical_prices(sym, days)
+    h_obj  = next((h for h in us_enriched if h["symbol"] == sym), None)
+    cost_p = h_obj["cost_per_share"] if h_obj else None
+    ch     = _chart_price(hist, sym, cost_p, COLOR_PURPLE, "$")
+    if ch:
+        _render(ch)
+        s = hist[sym].dropna()
+        sc1, sc2, sc3 = st.columns(3)
+        chg = s.iloc[-1] - s.iloc[0]; chg_pct = chg / s.iloc[0] * 100
+        sc1.metric("期初價", f"${s.iloc[0]:.2f}")
+        sc2.metric("現價",   f"${s.iloc[-1]:.2f}")
+        sc3.metric("期間漲跌", f"${chg:+.2f} ({chg_pct:+.2f}%)", delta_color=dc(chg))
+    else:
+        st.warning(f"無法取得 {sym} 歷史價格")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # TAB 4 — 損益歷史
 # ═════════════════════════════════════════════════════════════════════════════
 def _tab_history(tw_holdings, us_holdings):
-    ca, cb = st.columns([3, 1])
-    with ca:
-        st.markdown("<div class='section-title'>損益歷史分析</div>", unsafe_allow_html=True)
-    with cb:
-        days = st.selectbox("回溯期間", [90, 180, 365],
-                            format_func=lambda x: f"{x} 天", key="hist_days")
+    ca, cb = st.columns([4, 1])
+    ca.markdown("<div class='section-title'>損益歷史分析</div>", unsafe_allow_html=True)
+    days = cb.selectbox("回溯期間", [90, 180, 365],
+                        format_func=lambda x: f"{x} 天", key="hist_days")
 
     with st.spinner("計算歷史損益..."):
         tw_ph = {h["symbol"]: fetch_historical_prices(h["symbol"], days) for h in tw_holdings}
@@ -539,89 +618,52 @@ def _tab_history(tw_holdings, us_holdings):
         usd_h = fetch_usd_twd_history(days)
         df    = compute_portfolio_history(tw_holdings, us_holdings, tw_ph, us_ph, usd_h, days)
 
-    t1, t2, t3 = st.tabs(["📈 趨勢", "📊 每日/週", "📅 月度"])
+    if df.empty:
+        st.info("歷史資料不足，請確認 API 連線。"); return
+
+    t1, t2, t3 = st.tabs(["📈 趨勢", "📊 每日 / 週", "📅 月度"])
 
     with t1:
-        if df.empty:
-            st.info("歷史資料不足，請確認 API 連線。"); return
-        last_pnl = df["total_pnl_twd"].iloc[-1]
-        lc = COLOR_POSITIVE if last_pnl >= 0 else COLOR_NEGATIVE
-        fc = "rgba(0,200,150,0.1)" if last_pnl >= 0 else "rgba(255,75,92,0.1)"
-
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=df.index, y=df["total_pnl_twd"], name="未實現損益", yaxis="y",
-            line=dict(color=lc, width=2.5), fill="tozeroy", fillcolor=fc,
-        ))
-        fig.add_trace(go.Scatter(
-            x=df.index, y=df["total_value_twd"], name="總市值", yaxis="y2",
-            line=dict(color=COLOR_NEUTRAL, width=1.5, dash="dot"),
-        ))
-        fig.add_hline(y=0, line_color="rgba(255,255,255,0.2)", line_dash="dash")
-        layout = dict(**PLOTLY_LAYOUT)
-        layout.update(yaxis=dict(title="未實現損益 NT$", gridcolor="#30363D"),
-                      yaxis2=dict(title="總市值 NT$", overlaying="y", side="right",
-                                  gridcolor="rgba(0,0,0,0)"),
-                      legend=dict(orientation="h", y=1.05), height=360)
-        fig.update_layout(**layout)
-        plotly_chart(fig)
-
+        _render(_chart_pnl_trend(df))
         pnl_s = df["total_pnl_twd"].dropna()
         s1, s2, s3, s4 = st.columns(4)
         s1.metric("期間最高", fmt(pnl_s.max()))
         s2.metric("期間最低", fmt(pnl_s.min()))
-        s3.metric("期間變化", fmt(pnl_s.iloc[-1] - pnl_s.iloc[0]),
-                  delta_color=dc(pnl_s.iloc[-1] - pnl_s.iloc[0]))
+        chg = pnl_s.iloc[-1] - pnl_s.iloc[0]
+        s3.metric("期間變化", fmt(chg), delta_color=dc(chg))
         s4.metric("損益率",   f"{df['pnl_pct'].iloc[-1]:+.2f}%")
 
     with t2:
-        if df.empty: return
-        daily = df["daily_pnl_change"].dropna().tail(60)
-        colors_d = [COLOR_POSITIVE if v >= 0 else COLOR_NEGATIVE for v in daily]
-        fig2 = go.Figure(go.Bar(
-            x=daily.index, y=daily.values, marker_color=colors_d,
-            text=[f"${v/1000:+.1f}K" for v in daily.values],
-            textposition="outside", textfont_size=9,
-        ))
-        fig2.add_hline(y=0, line_color="rgba(255,255,255,0.2)")
-        fig2.update_layout(**PLOTLY_LAYOUT, yaxis_title="每日損益 NT$", height=300,
-                            title="近 60 日每日損益")
-        plotly_chart(fig2)
-
+        daily  = df["daily_pnl_change"].dropna().tail(60)
         weekly = df["daily_pnl_change"].dropna().resample("W").sum()
-        colors_w = [COLOR_POSITIVE if v >= 0 else COLOR_NEGATIVE for v in weekly]
-        fig3 = go.Figure(go.Bar(
-            x=weekly.index.strftime("%m/%d"), y=weekly.values,
-            marker_color=colors_w,
-        ))
-        fig3.update_layout(**PLOTLY_LAYOUT, yaxis_title="週損益 NT$", height=250, title="每週損益")
-        plotly_chart(fig3)
+        _render(_chart_daily_bar(daily, "近 60 日每日損益"))
+        _render(_chart_daily_bar(weekly, "每週損益"))
 
     with t3:
-        if df.empty: return
         monthly = df["daily_pnl_change"].dropna().resample("ME").sum()
         df_m = pd.DataFrame({"月份": monthly.index.strftime("%Y-%m"), "損益": monthly.values})
-        colors_m = [COLOR_POSITIVE if v >= 0 else COLOR_NEGATIVE for v in df_m["損益"]]
+        df_m["color"] = df_m["損益"].apply(lambda x: COLOR_POSITIVE if x >= 0 else COLOR_NEGATIVE)
 
         ca2, cb2 = st.columns([3, 2])
         with ca2:
-            fig4 = go.Figure(go.Bar(
-                x=df_m["月份"], y=df_m["損益"], marker_color=colors_m,
-                text=[fmt(v) for v in df_m["損益"]], textposition="outside", textfont_size=10,
-            ))
-            fig4.update_layout(**PLOTLY_LAYOUT, height=300, title="月度損益")
-            plotly_chart(fig4)
+            bar = alt.Chart(df_m).mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3).encode(
+                x=alt.X("月份:N", sort=None, title=None, axis=alt.Axis(labelAngle=-30)),
+                y=alt.Y("損益:Q", title="NT$"),
+                color=alt.Color("color:N", scale=None, legend=None),
+                tooltip=[alt.Tooltip("月份:N"), alt.Tooltip("損益:Q", format="+,.0f")],
+            ).properties(height=280, title="月度損益")
+            _render(bar)
         with cb2:
-            pos = (df_m["損益"] > 0).sum()
-            neg = (df_m["損益"] < 0).sum()
+            pos  = (df_m["損益"] > 0).sum()
+            neg  = (df_m["損益"] < 0).sum()
             best  = df_m.loc[df_m["損益"].idxmax()]
             worst = df_m.loc[df_m["損益"].idxmin()]
             st.markdown("<div class='section-title'>月度統計</div>", unsafe_allow_html=True)
             st.metric("獲利月",   f"{pos} 個月")
             st.metric("虧損月",   f"{neg} 個月")
             st.metric("月勝率",   f"{pos/max(pos+neg,1)*100:.1f}%")
-            st.metric("最佳月份", best["月份"],   fmt(best["損益"]))
-            st.metric("最差月份", worst["月份"],  fmt(worst["損益"]))
+            st.metric("最佳月份", best["月份"],  fmt(best["損益"]))
+            st.metric("最差月份", worst["月份"], fmt(worst["損益"]))
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -632,30 +674,29 @@ def _tab_pledge(prices, usd_twd):
     loans      = pledge_cfg.get("loans", [])
     ALL_SYMS   = list(TW_TICKERS.keys()) + list(US_TICKERS.keys())
 
-    # ── Add/Delete pledge ────────────────────────────────────────────────────
     with st.expander("➕ 新增 / 管理質押設定", expanded=not loans):
         with st.form("add_pledge"):
             c1, c2 = st.columns(2)
             with c1:
-                desc    = st.text_input("說明", placeholder="台股質押 A")
-                loan_amt = st.number_input("借款金額（TWD）", min_value=0, step=10000, value=500000)
-                interest = st.number_input("年利率（%）", 0.0, 20.0, 2.5, 0.1)
-                from datetime import date
+                desc      = st.text_input("說明", placeholder="台股質押 A")
+                loan_amt  = st.number_input("借款金額（TWD）", min_value=0, step=10000, value=500000)
+                interest  = st.number_input("年利率（%）", 0.0, 20.0, 2.5, 0.1)
                 loan_date = st.date_input("借款日期", value=date.today())
             with c2:
                 pledged_syms = st.multiselect("質押股票", ALL_SYMS)
-                pledged_shares = {}
+                p_shares = {}
                 for sym in pledged_syms:
-                    pledged_shares[sym] = st.number_input(
+                    p_shares[sym] = st.number_input(
                         f"{sym} 質押股數", 0, step=100, value=1000, key=f"ps_{sym}"
                     )
             if st.form_submit_button("新增", use_container_width=True, type="primary"):
                 if loan_amt > 0 and pledged_syms:
+                    new_id = (max(l["id"] for l in loans) + 1) if loans else 1
                     loans.append({
-                        "id": (max(l["id"] for l in loans) + 1) if loans else 1,
-                        "description": desc or f"質押 {len(loans)+1}",
+                        "id": new_id,
+                        "description": desc or f"質押 {new_id}",
                         "pledged_stocks": [
-                            {"symbol": s, "shares": pledged_shares[s],
+                            {"symbol": s, "shares": p_shares[s],
                              "currency": "TWD" if s in TW_TICKERS else "USD"}
                             for s in pledged_syms
                         ],
@@ -674,116 +715,64 @@ def _tab_pledge(prices, usd_twd):
                 st.rerun()
 
     if not loans:
-        st.info("尚無質押設定。")
-        return
+        st.info("尚無質押設定。"); return
 
-    # ── Fetch pledged stock prices ────────────────────────────────────────────
-    pledged_syms = tuple({s["symbol"] for loan in loans for s in loan["pledged_stocks"]})
-    if pledged_syms:
-        pledge_prices = fetch_current_prices(pledged_syms)
-    else:
-        pledge_prices = {}
+    pledged_syms_all = tuple({s["symbol"] for loan in loans for s in loan["pledged_stocks"]})
+    pledge_prices    = fetch_current_prices(pledged_syms_all) if pledged_syms_all else {}
 
-    # ── Gauge cards ──────────────────────────────────────────────────────────
     for loan in loans:
         ratio, p_value = compute_pledge_ratio(
             loan["pledged_stocks"], pledge_prices, loan["loan_amount_twd"], usd_twd
         )
-
-        if ratio is None:
-            st.warning(f"**{loan['description']}** — 無法取得現價"); continue
-
-        # Determine status
-        if ratio >= PLEDGE_SAFE:
-            bar_c, badge = COLOR_POSITIVE, ("badge-safe", "🟢 安全")
-        elif ratio >= PLEDGE_WARNING:
-            bar_c, badge = COLOR_NEUTRAL,  ("badge-watch", "🔵 觀察")
-        elif ratio >= PLEDGE_CRITICAL:
-            bar_c, badge = COLOR_WARNING,  ("badge-warn", "🟡 警告")
-        else:
-            bar_c, badge = COLOR_NEGATIVE, ("badge-critical", "🔴 追繳！")
-
         st.markdown(f"### {loan['description']}")
 
-        ga, gb = st.columns([2, 1])
-        with ga:
-            fig_g = go.Figure(go.Indicator(
-                mode="gauge+number",
-                value=ratio,
-                number={"suffix": "%", "font": {"size": 40, "color": "#E6EDF3"}},
-                title={"text": f"維持率 　<span class='{badge[0]}'>{badge[1]}</span>",
-                       "font": {"size": 15, "color": "#E6EDF3"}},
-                gauge={
-                    "axis": {"range": [0, 500], "tickcolor": "#8B949E",
-                              "tickfont": {"color": "#8B949E"}, "tickwidth": 1},
-                    "bar":  {"color": bar_c, "thickness": 0.22},
-                    "bgcolor": "rgba(0,0,0,0)",
-                    "bordercolor": "#30363D",
-                    "steps": [
-                        {"range": [0,           PLEDGE_CRITICAL], "color": "rgba(255,75,92,0.2)"},
-                        {"range": [PLEDGE_CRITICAL, PLEDGE_WARNING], "color": "rgba(255,183,77,0.15)"},
-                        {"range": [PLEDGE_WARNING,  PLEDGE_SAFE],    "color": "rgba(74,144,217,0.15)"},
-                        {"range": [PLEDGE_SAFE,      500],           "color": "rgba(0,200,150,0.1)"},
-                    ],
-                    "threshold": {
-                        "line": {"color": COLOR_NEGATIVE, "width": 4},
-                        "thickness": 0.8, "value": PLEDGE_CRITICAL,
-                    },
-                },
-            ))
-            fig_g.update_layout(paper_bgcolor="rgba(0,0,0,0)",
-                                 font={"color": "#E6EDF3"}, height=260,
-                                 margin=dict(t=30, b=10, l=20, r=20))
-            st.plotly_chart(fig_g, use_container_width=True, config={"displayModeBar": False})
+        if ratio is None:
+            st.warning("無法取得現價"); continue
 
+        ga, gb = st.columns([3, 1])
+        with ga:
+            _render(_chart_pledge_gauge(ratio), height=100)
+            if ratio < PLEDGE_CRITICAL:
+                st.error(f"⚠️ 緊急！維持率 {ratio:.1f}% 已低於追繳線 {PLEDGE_CRITICAL}%！")
+            elif ratio < PLEDGE_WARNING:
+                st.warning(f"⚠️ 維持率 {ratio:.1f}% 低於警戒線 {PLEDGE_WARNING}%，請注意。")
         with gb:
-            st.metric("維持率",     f"{ratio:.1f}%")
+            st.metric("維持率",      f"{ratio:.1f}%")
             st.metric("質押股票市值", fmt(p_value))
-            st.metric("借款金額",    fmt(loan["loan_amount_twd"]))
-            st.metric("年利率",      f"{loan['interest_rate']:.1f}%")
-            # Estimated margin call price for TW stocks
+            st.metric("借款金額",     fmt(loan["loan_amount_twd"]))
+            st.metric("年利率",       f"{loan['interest_rate']:.1f}%")
             tw_shares = sum(s["shares"] for s in loan["pledged_stocks"] if s.get("currency") == "TWD")
             if tw_shares > 0:
                 mc_val = loan["loan_amount_twd"] * PLEDGE_CRITICAL / 100
                 st.metric("台股追繳均價", f"NT${mc_val/tw_shares:.2f}",
-                           help="台股跌至此均價將觸發追繳（不含美股）")
+                           help="台股跌至此均價將觸發追繳")
 
-        if ratio < PLEDGE_CRITICAL:
-            st.error(f"⚠️ 緊急！維持率 {ratio:.1f}% 已低於追繳線 {PLEDGE_CRITICAL}%！")
-        elif ratio < PLEDGE_WARNING:
-            st.warning(f"⚠️ 維持率 {ratio:.1f}% 低於警戒線 {PLEDGE_WARNING}%，請注意。")
-
+        # Pledged stocks table
+        rows = [{
+            "代號": ps["symbol"],
+            "質押股數": ps["shares"],
+            "現價": f"{pledge_prices.get(ps['symbol'], '—'):.2f}" if pledge_prices.get(ps['symbol']) else "—",
+            "市值(TWD)": fmt(ps["shares"] * pledge_prices[ps["symbol"]] *
+                             (usd_twd if ps.get("currency") == "USD" else 1))
+                         if pledge_prices.get(ps["symbol"]) else "—",
+            "幣別": ps.get("currency", "TWD"),
+        } for ps in loan["pledged_stocks"]]
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
         st.markdown("---")
 
-    # ── Historical ratio chart ────────────────────────────────────────────────
-    if loans:
-        st.markdown("<div class='section-title'>維持率趨勢（以首筆質押估算）</div>", unsafe_allow_html=True)
-        first = loans[0]
-        usd_h = fetch_usd_twd_history(90)
-        ratio_s = None
-        for ps in first["pledged_stocks"]:
-            df_p = fetch_historical_prices(ps["symbol"], 90)
-            if df_p.empty:
-                continue
-            fx = usd_h.reindex(df_p.index, method="ffill").fillna(usd_twd) if ps.get("currency") == "USD" else 1.0
-            val = df_p[ps["symbol"]] * ps["shares"] * fx
-            ratio_s = val if ratio_s is None else ratio_s + val
-        if ratio_s is not None:
-            ratio_pct = ratio_s / first["loan_amount_twd"] * 100
-            fig_r = go.Figure()
-            fig_r.add_trace(go.Scatter(
-                x=ratio_pct.index, y=ratio_pct.values,
-                mode="lines", line=dict(color=COLOR_NEUTRAL, width=2), name="維持率 %",
-            ))
-            for thresh, color, label in [
-                (PLEDGE_CRITICAL, COLOR_NEGATIVE, f"追繳 {PLEDGE_CRITICAL}%"),
-                (PLEDGE_WARNING,  COLOR_WARNING,  f"警戒 {PLEDGE_WARNING}%"),
-                (PLEDGE_SAFE,     COLOR_POSITIVE, f"安全 {PLEDGE_SAFE}%"),
-            ]:
-                fig_r.add_hline(y=thresh, line_color=color, line_dash="dash",
-                                 annotation_text=label, annotation_position="right")
-            fig_r.update_layout(**PLOTLY_LAYOUT, yaxis_title="維持率 %", height=280)
-            plotly_chart(fig_r)
+    # Historical ratio chart (first loan)
+    first = loans[0]
+    usd_h = fetch_usd_twd_history(90)
+    ratio_s = None
+    for ps in first["pledged_stocks"]:
+        df_p = fetch_historical_prices(ps["symbol"], 90)
+        if df_p.empty: continue
+        fx = usd_h.reindex(df_p.index, method="ffill").fillna(usd_twd) \
+             if ps.get("currency") == "USD" else 1.0
+        val = df_p[ps["symbol"]] * ps["shares"] * fx
+        ratio_s = val if ratio_s is None else ratio_s + val
+    if ratio_s is not None:
+        _render(_chart_ratio_history(ratio_s / first["loan_amount_twd"] * 100))
 
 
 # ═════════════════════════════════════════════════════════════════════════════
