@@ -6,7 +6,9 @@ import json
 import streamlit as st
 import altair as alt
 import pandas as pd
-from datetime import datetime, date
+from datetime import datetime, date, timezone, timedelta
+
+_TZ8 = timezone(timedelta(hours=8))   # UTC+8 (Asia/Taipei)
 
 from config.settings import (
     APP_NAME, APP_ICON,
@@ -22,6 +24,7 @@ from utils.auth import (
 from utils.data_loader import (
     load_tw_holdings, load_us_holdings,
     load_pledge_config, save_pledge_config,
+    load_tw_transactions,
 )
 from utils.price_fetcher import (
     fetch_current_prices, fetch_usd_twd_rate,
@@ -131,13 +134,16 @@ def dc(v):
 
 # ── Cached history helper (hashable args via JSON) ────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
-def _cached_history(tw_json: str, us_json: str, days: int) -> pd.DataFrame:
-    tw_h = json.loads(tw_json)
-    us_h = json.loads(us_json)
-    tw_ph = {h["symbol"]: fetch_historical_prices(h["symbol"], days) for h in tw_h}
-    us_ph = {h["symbol"]: fetch_historical_prices(h["symbol"], days) for h in us_h}
-    usd_h = fetch_usd_twd_history(days)
-    return compute_portfolio_history(tw_h, us_h, tw_ph, us_ph, usd_h, days)
+def _cached_history(tw_json: str, us_json: str, days: int,
+                    tw_txn_json: str = "[]") -> pd.DataFrame:
+    tw_h   = json.loads(tw_json)
+    us_h   = json.loads(us_json)
+    tw_txn = json.loads(tw_txn_json)
+    tw_ph  = {h["symbol"]: fetch_historical_prices(h["symbol"], days) for h in tw_h}
+    us_ph  = {h["symbol"]: fetch_historical_prices(h["symbol"], days) for h in us_h}
+    usd_h  = fetch_usd_twd_history(days)
+    return compute_portfolio_history(tw_h, us_h, tw_ph, us_ph, usd_h, days,
+                                     tw_transactions=tw_txn)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -216,27 +222,51 @@ def show_auth():
 
 def _chart_pie(df: pd.DataFrame, value_col: str, label_col: str,
                title: str, colors=None) -> alt.Chart:
-    """Solid pie chart, sorted clockwise largest-first, with % tooltip."""
-    total   = df[value_col].sum()
-    df      = df.copy()
-    df["pct"] = df[value_col] / total * 100
-    df      = df.sort_values(value_col, ascending=False).reset_index(drop=True)
-    n       = len(df)
-    clrs    = (colors or PALETTE)[:n]
+    """
+    Solid pie chart, sorted clockwise largest-first (12 o'clock start).
+    Labels (ticker + %) rendered directly on each slice — no legend.
+    Slices < 4 % get no label to avoid clutter.
+    """
+    total = df[value_col].sum()
+    df    = df.copy()
+    df["pct"]        = df[value_col] / total * 100
+    df["ticker_lbl"] = df.apply(lambda r: r[label_col] if r["pct"] >= 4 else "", axis=1)
+    df["pct_lbl"]    = df["pct"].apply(lambda x: f"{x:.1f}%" if x >= 4 else "")
+    df = df.sort_values(value_col, ascending=False).reset_index(drop=True)
+    n    = len(df)
+    clrs = (colors or PALETTE)[:n]
+
+    base = alt.Chart(df).encode(
+        theta=alt.Theta(f"{value_col}:Q", stack=True),
+        color=alt.Color(
+            f"{label_col}:N",
+            scale=alt.Scale(range=clrs, domain=df[label_col].tolist()),
+            legend=None,
+        ),
+    )
+
+    pie = base.mark_arc(outerRadius=120, padAngle=0.02).encode(
+        tooltip=[
+            alt.Tooltip(f"{label_col}:N", title=""),
+            alt.Tooltip(f"{value_col}:Q", format=",.0f", title="NT$"),
+            alt.Tooltip("pct:Q", format=".1f", title="%"),
+        ]
+    )
+
+    # Ticker name above mid-angle, percent below
+    text_ticker = base.mark_text(radius=148, dy=-7, fontSize=11,
+                                  fontWeight="bold").encode(
+        text=alt.Text("ticker_lbl:N"),
+        color=alt.value("#E6EDF3"),
+    )
+    text_pct = base.mark_text(radius=148, dy=7, fontSize=10).encode(
+        text=alt.Text("pct_lbl:N"),
+        color=alt.value("#8B949E"),
+    )
+
     return (
-        alt.Chart(df).mark_arc(padAngle=0.025).encode(
-            theta=alt.Theta(f"{value_col}:Q", stack=True),
-            color=alt.Color(f"{label_col}:N",
-                            scale=alt.Scale(range=clrs),
-                            sort=df[label_col].tolist(),
-                            legend=alt.Legend(title=None, orient="bottom",
-                                              columns=3, labelLimit=120)),
-            tooltip=[
-                alt.Tooltip(f"{label_col}:N", title=""),
-                alt.Tooltip(f"{value_col}:Q", format=",.0f", title="NT$"),
-                alt.Tooltip("pct:Q", format=".1f", title="%"),
-            ],
-        ).properties(height=240, title=title)
+        alt.layer(pie, text_ticker, text_pct)
+        .properties(height=320, title=title)
     )
 
 
@@ -261,6 +291,33 @@ def _chart_price(hist: pd.DataFrame, sym: str, cost_price=None,
                      tooltip=alt.Tooltip("c:Q", format=".2f", title="Cost"))
         )
     return alt.layer(*layers).properties(height=260)
+
+
+def _chart_pnl_level(series: pd.Series, title: str):
+    """Area + line chart showing absolute unrealized P&L level over time."""
+    df = series.reset_index()
+    df.columns = ["date", "pnl"]
+    clr = COLOR_POSITIVE if df["pnl"].iloc[-1] >= 0 else COLOR_NEGATIVE
+
+    base = alt.Chart(df).encode(x=alt.X("date:T", title=None))
+    area = base.mark_area(opacity=0.12, interpolate="monotone",
+                          color=clr)
+    line = base.mark_line(strokeWidth=2, interpolate="monotone",
+                          color=clr).encode(
+        y=alt.Y("pnl:Q", title="NT$", axis=alt.Axis(format=".3~s")),
+        tooltip=[
+            alt.Tooltip("date:T", format="%Y-%m-%d"),
+            alt.Tooltip("pnl:Q", format="+,.0f", title="NT$"),
+        ],
+    )
+    area = area.encode(
+        y=alt.Y("pnl:Q", title="NT$", axis=alt.Axis(format=".3~s")),
+    )
+    zero = alt.Chart(pd.DataFrame([{"y": 0}])).mark_rule(
+        color="rgba(255,255,255,0.2)"
+    ).encode(y="y:Q")
+
+    return alt.layer(area, line, zero).properties(height=220, title=title)
 
 
 def _chart_pnl_bars(series: pd.Series, title: str):
@@ -374,10 +431,11 @@ def render_dashboard():
     # ── Header ────────────────────────────────────────────────────────────────
     h1, h2 = st.columns([5, 1])
     with h1:
+        _now8 = datetime.now(_TZ8).strftime('%Y/%m/%d %H:%M')
         st.markdown(
             "<div style='font-size:1.4rem;font-weight:700'>📈 Investment Dashboard</div>"
             f"<div style='font-size:0.78rem;color:#8B949E'>"
-            f"Updated: {datetime.now().strftime('%Y/%m/%d %H:%M')}"
+            f"Updated: {_now8} (UTC+8)"
             f"&nbsp;&nbsp;USD/TWD: {usd_twd:.2f} (Cathay)</div>",
             unsafe_allow_html=True)
     with h2:
@@ -424,7 +482,7 @@ def render_dashboard():
         _section_pledge(prices, usd_twd)
 
     with tab_upload:
-        _tab_upload(tw_h, us_h)
+        _tab_upload()
 
 
 # ── Profile panel ─────────────────────────────────────────────────────────────
@@ -570,24 +628,33 @@ def _section_pnl_history(tw_h, us_h):
     st.markdown("<div class='section-title'>P&L Change History</div>",
                 unsafe_allow_html=True)
 
-    tw_json = json.dumps(tw_h)
-    us_json = json.dumps(us_h)
+    tw_json    = json.dumps(tw_h)
+    us_json    = json.dumps(us_h)
+    tw_txn_json = json.dumps(load_tw_transactions())
 
     h1, h2, h3 = st.tabs(["📅 Daily (60d)", "📆 Monthly (This Year)", "📊 Annual (3Y)"])
 
     with h1:
         with st.spinner("Loading price history…"):
-            df90 = _cached_history(tw_json, us_json, 90)
+            df90 = _cached_history(tw_json, us_json, 90, tw_txn_json)
         if df90.empty:
             st.info("No data yet."); return
+
+        # Chart A — absolute unrealized P&L level
+        pnl_level = df90["total_pnl_twd"].dropna().tail(60)
+        _render(_chart_pnl_level(pnl_level,
+                                  "Unrealized P&L Level (last 60 trading days)"))
+
+        # Chart B — daily P&L change (delta)
         daily = df90["daily_pnl_change"].dropna()
-        _render(_chart_pnl_bars(daily.tail(60), "Daily P&L Change (last 60 trading days)"))
+        _render(_chart_pnl_bars(daily.tail(60),
+                                 "Daily P&L Change — day-over-day delta"))
         _stats_row(daily)
 
     with h2:
         with st.spinner("Loading monthly data…"):
-            this_year = datetime.now().year
-            df_yr = _cached_history(tw_json, us_json, 365)
+            this_year = datetime.now(_TZ8).year
+            df_yr = _cached_history(tw_json, us_json, 365, tw_txn_json)
         if df_yr.empty:
             st.info("No data yet."); return
         monthly = (df_yr["daily_pnl_change"]
@@ -603,7 +670,7 @@ def _section_pnl_history(tw_h, us_h):
 
     with h3:
         with st.spinner("Loading 3-year history (first load may take ~10 s)…"):
-            df3y = _cached_history(tw_json, us_json, 1095)
+            df3y = _cached_history(tw_json, us_json, 1095, tw_txn_json)
         if df3y.empty:
             st.info("No data yet."); return
         annual = df3y["daily_pnl_change"].dropna().resample("YS").sum()
@@ -627,29 +694,140 @@ def _stats_row(series: pd.Series):
     s5.metric("Win Rate",   f"{pos / max(pos + neg, 1) * 100:.0f}%")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Pledge helpers
+# ─────────────────────────────────────────────────────────────────────────────
+_PLEDGE_COLS = ["Description", "Loan Amount (TWD)", "Rate (%)",
+                "Date", "Symbol", "Shares", "Currency"]
+
+
+def _loans_to_df(loans) -> pd.DataFrame:
+    """Expand loan list to a flat DataFrame — one row per pledged stock."""
+    rows = []
+    for loan in loans:
+        for ps in loan.get("pledged_stocks", []):
+            rows.append({
+                "Description":      loan.get("description", ""),
+                "Loan Amount (TWD)": int(loan.get("loan_amount_twd", 0)),
+                "Rate (%)":          float(loan.get("interest_rate", 0.0)),
+                "Date":              loan.get("date", ""),
+                "Symbol":            ps.get("symbol", ""),
+                "Shares":            int(ps.get("shares", 0)),
+                "Currency":          ps.get("currency", "TWD"),
+            })
+    return pd.DataFrame(rows, columns=_PLEDGE_COLS) if rows else pd.DataFrame(
+        columns=_PLEDGE_COLS)
+
+
+def _df_to_loans(df: pd.DataFrame):
+    """Collapse flat DataFrame back to loan list (groups by Description)."""
+    if df.empty:
+        return []
+    df = df.copy()
+    # Drop rows without a description
+    df["Description"] = df["Description"].astype(str).str.strip()
+    df = df[df["Description"] != ""]
+    df = df[df["Description"] != "nan"]
+
+    loans    = []
+    loan_id  = 1
+    seen     = {}          # description → index in loans list
+
+    for _, row in df.iterrows():
+        desc   = str(row["Description"]).strip()
+        sym    = str(row.get("Symbol", "")).strip().upper()
+        shares = int(row.get("Shares", 0) or 0)
+        if not desc or not sym or shares <= 0:
+            continue
+        if desc not in seen:
+            seen[desc] = len(loans)
+            loans.append({
+                "id":               loan_id,
+                "description":      desc,
+                "pledged_stocks":   [],
+                "loan_amount_twd":  float(row.get("Loan Amount (TWD)", 0) or 0),
+                "interest_rate":    float(row.get("Rate (%)", 0.0) or 0.0),
+                "date":             str(row.get("Date", "") or ""),
+            })
+            loan_id += 1
+        loans[seen[desc]]["pledged_stocks"].append({
+            "symbol":   sym,
+            "shares":   shares,
+            "currency": str(row.get("Currency", "TWD") or "TWD"),
+        })
+
+    return loans
+
+
 # ═════════════════════════════════════════════════════════════════════════════
-# SECTION: Pledge Monitoring (read-only table in Dashboard)
+# SECTION: Pledge Monitoring (editable via st.data_editor)
 # ═════════════════════════════════════════════════════════════════════════════
 def _section_pledge(prices, usd_twd):
-    from utils.gsheets import (is_configured as sheets_ok, load_pledge_from_sheet,
-                                sheet_url as gsheet_url)
-
-    if sheets_ok():
-        loans = load_pledge_from_sheet() or load_pledge_config().get("loans", [])
-    else:
-        loans = load_pledge_config().get("loans", [])
-
-    if not loans:
-        return  # No pledge data → hide this section entirely
+    loans = load_pledge_config().get("loans", [])
 
     st.markdown("<div class='section-title'>Pledge Monitoring</div>",
                 unsafe_allow_html=True)
 
-    # Fetch prices for pledged symbols
-    p_syms = tuple({s["symbol"] for loan in loans for s in loan.get("pledged_stocks", [])})
+    # ── Editable pledge definition table ─────────────────────────────────────
+    st.caption(
+        "Edit loans below — one row per pledged stock. "
+        "Rows sharing the same **Description** are grouped into one loan. "
+        "Click **＋** to add rows; select a row and press **Delete** to remove it. "
+        "Press **Save** when done."
+    )
+
+    ALL_SYMS = list(TW_TICKERS.keys()) + list(US_TICKERS.keys())
+
+    edited_df = st.data_editor(
+        _loans_to_df(loans),
+        num_rows="dynamic",
+        column_config={
+            "Description":       st.column_config.TextColumn(
+                "Description", required=True, help="Loan name / label"),
+            "Loan Amount (TWD)": st.column_config.NumberColumn(
+                "Loan Amount (TWD)", min_value=0, step=10000, format="%d"),
+            "Rate (%)":          st.column_config.NumberColumn(
+                "Rate (%)", min_value=0.0, max_value=20.0, step=0.1, format="%.2f"),
+            "Date":              st.column_config.TextColumn(
+                "Date", help="YYYY-MM-DD"),
+            "Symbol":            st.column_config.SelectboxColumn(
+                "Symbol", options=ALL_SYMS + [""], required=True),
+            "Shares":            st.column_config.NumberColumn(
+                "Shares", min_value=0, step=100, format="%d"),
+            "Currency":          st.column_config.SelectboxColumn(
+                "Currency", options=["TWD", "USD"], required=True),
+        },
+        use_container_width=True,
+        hide_index=True,
+        key="pledge_editor",
+    )
+
+    if st.button("💾  Save Pledge Data", type="primary"):
+        new_loans = _df_to_loans(edited_df)
+        save_pledge_config({"loans": new_loans})
+        # Also sync to gsheets if configured
+        try:
+            from utils.gsheets import is_configured as sheets_ok, save_pledge_to_sheet
+            if sheets_ok():
+                save_pledge_to_sheet(new_loans)
+        except Exception:
+            pass
+        st.success("Saved!"); st.rerun()
+
+    # ── Live monitoring table (read-only, computed from live prices) ───────────
+    # Reload after potential save
+    loans = load_pledge_config().get("loans", [])
+    if not loans:
+        return
+
+    st.markdown("<div style='margin-top:12px'></div>", unsafe_allow_html=True)
+    st.caption("**Live Maintenance Ratios**")
+
+    p_syms   = tuple({s["symbol"] for loan in loans
+                      for s in loan.get("pledged_stocks", [])})
     p_prices = fetch_current_prices(p_syms) if p_syms else {}
 
-    rows = []
+    rows               = []
     total_pledge_value = 0.0
     total_loan_amount  = 0.0
 
@@ -676,16 +854,17 @@ def _section_pledge(prices, usd_twd):
             status = "🟢 Safe"
 
         rows.append({
-            "Description":     loan["description"],
-            "Pledged Stocks":  stocks_str,
-            "Pledged Value":   fmt(p_value) if p_value else "—",
-            "Loan Amount":     fmt(loan["loan_amount_twd"]),
-            "Rate":            f"{loan.get('interest_rate', 0):.1f}%",
-            "Ratio":           f"{ratio:.1f}%" if ratio is not None else "—",
-            "Status":          status,
+            "Description":    loan["description"],
+            "Pledged Stocks": stocks_str,
+            "Pledged Value":  fmt(p_value) if p_value else "—",
+            "Loan Amount":    fmt(loan["loan_amount_twd"]),
+            "Rate":           f"{loan.get('interest_rate', 0):.1f}%",
+            "Ratio":          f"{ratio:.1f}%" if ratio is not None else "—",
+            "Status":         status,
         })
 
     # Overall row
+    overall_ratio = None
     if total_loan_amount > 0:
         overall_ratio = total_pledge_value / total_loan_amount * 100
         if overall_ratio < PLEDGE_CRITICAL:
@@ -696,7 +875,6 @@ def _section_pledge(prices, usd_twd):
             ov_status = "🟡 Watch"
         else:
             ov_status = "🟢 Safe"
-
         rows.append({
             "Description":    "**Overall**",
             "Pledged Stocks": "",
@@ -708,17 +886,14 @@ def _section_pledge(prices, usd_twd):
         })
 
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-    # Show gauge for overall ratio
-    if total_loan_amount > 0:
+    if overall_ratio is not None:
         _render(_chart_pledge_gauge(overall_ratio), height=100)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# TAB: Upload (CSV + Pledge Management)
+# TAB: Upload (CSV files only)
 # ═════════════════════════════════════════════════════════════════════════════
-def _tab_upload(tw_h, us_h):
-    # ── CSV Uploads ───────────────────────────────────────────────────────────
+def _tab_upload():
     st.markdown("<div class='section-title'>Upload Holdings CSV</div>",
                 unsafe_allow_html=True)
     uc1, uc2 = st.columns(2)
@@ -744,115 +919,6 @@ def _tab_upload(tw_h, us_h):
             except Exception:
                 pass
             st.success("US CSV uploaded"); st.cache_data.clear(); st.rerun()
-
-    # ── Price History Chart ───────────────────────────────────────────────────
-    st.markdown("<div class='section-title'>Individual Stock Price</div>",
-                unsafe_allow_html=True)
-
-    all_h = tw_h + us_h
-    if all_h:
-        col_a, col_b, col_c = st.columns([3, 1, 1])
-        options = [f"{_sym(h['symbol'], h['currency'])} ({h['name']})" for h in all_h]
-        sel     = col_a.selectbox("Ticker", options, key="price_sel")
-        period  = col_b.radio("Period", ["3M", "6M", "1Y", "2Y"],
-                               horizontal=True, key="price_per")
-        idx     = options.index(sel)
-        h_obj   = all_h[idx]
-        sym     = h_obj["symbol"]
-        is_us   = h_obj["currency"] == "USD"
-        days    = {"3M": 90, "6M": 180, "1Y": 365, "2Y": 730}[period]
-        lc      = COLOR_PURPLE if is_us else COLOR_NEUTRAL
-        pref    = "$" if is_us else "NT$"
-        with st.spinner(f"Fetching {_sym(sym, h_obj['currency'])} price history…"):
-            hist = fetch_historical_prices(sym, days)
-        ch = _chart_price(hist, sym, h_obj.get("cost_per_share"), lc, pref)
-        if ch:
-            _render(ch)
-            if not hist.empty:
-                s = hist[sym].dropna()
-                chg = s.iloc[-1] - s.iloc[0]; chg_pct = chg / s.iloc[0] * 100
-                with col_c:
-                    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
-                    st.metric("Current",     f"{pref}{s.iloc[-1]:.2f}")
-                    st.metric("Period Chg",  f"{chg_pct:+.2f}%", delta_color=dc(chg))
-                    if h_obj.get("cost_per_share"):
-                        diff = s.iloc[-1] - h_obj["cost_per_share"]
-                        st.metric("vs Cost",  f"{diff:+.2f}", delta_color=dc(diff))
-        else:
-            st.warning(f"No price data for {sym}")
-
-    # ── Pledge Management ─────────────────────────────────────────────────────
-    st.markdown("<div class='section-title'>Pledge Management</div>",
-                unsafe_allow_html=True)
-
-    from utils.gsheets import (is_configured as sheets_ok, load_pledge_from_sheet,
-                                save_pledge_to_sheet, sheet_url as gsheet_url)
-
-    if sheets_ok():
-        url = gsheet_url()
-        st.success(f"✅ Pledge data synced to Google Sheets — [Open Sheet]({url})")
-        loans = load_pledge_from_sheet() or load_pledge_config().get("loans", [])
-    else:
-        loans = load_pledge_config().get("loans", [])
-        with st.expander("ℹ️ Google Sheets not configured"):
-            st.markdown("""
-1. Enable **Google Sheets API** in Google Cloud Console (same project as Drive API)
-2. Create a Google Sheet, rename the first tab to `質押明細`
-3. Share with the service account email (Editor)
-4. Copy the Sheet ID from the URL: `.../spreadsheets/d/<ID>/edit`
-5. Add `GOOGLE_PLEDGE_SHEET_ID` env var in Railway
-
-Sheet columns: `說明 | 借款金額TWD | 年利率% | 借款日期 | 質押代號 | 質押股數 | 幣別`
-""")
-
-    ALL_SYMS = list(TW_TICKERS.keys()) + list(US_TICKERS.keys())
-
-    with st.expander("➕ Add Pledge"):
-        with st.form("add_pledge"):
-            c1, c2 = st.columns(2)
-            with c1:
-                desc      = st.text_input("Description", placeholder="Pledge A")
-                loan_amt  = st.number_input("Loan Amount (TWD)", min_value=0,
-                                             step=10000, value=500000)
-                interest  = st.number_input("Annual Rate (%)", 0.0, 20.0, 2.5, 0.1)
-                loan_date = st.date_input("Date", value=date.today())
-            with c2:
-                p_syms   = st.multiselect("Pledged Stocks", ALL_SYMS)
-                p_shares = {s: st.number_input(f"{_sym(s, 'TWD' if s in TW_TICKERS else 'USD')}"
-                                                f" shares", 0, step=100, value=1000,
-                                                key=f"ps_{s}")
-                            for s in p_syms}
-            if st.form_submit_button("Add", use_container_width=True, type="primary"):
-                if loan_amt > 0 and p_syms:
-                    new_id = (max(l["id"] for l in loans) + 1) if loans else 1
-                    loans.append({
-                        "id": new_id,
-                        "description": desc or f"Pledge {new_id}",
-                        "pledged_stocks": [
-                            {"symbol": s, "shares": p_shares[s],
-                             "currency": "TWD" if s in TW_TICKERS else "USD"}
-                            for s in p_syms],
-                        "loan_amount_twd": loan_amt,
-                        "interest_rate":   interest,
-                        "date":            str(loan_date),
-                    })
-                    save_pledge_config({"loans": loans})
-                    if sheets_ok():
-                        save_pledge_to_sheet(loans)
-                    st.success("Added"); st.rerun()
-
-    if loans:
-        with st.expander("🗑 Delete Pledge"):
-            del_c = st.selectbox("Select to delete",
-                                  ["—"] + [f"#{l['id']} {l['description']}"
-                                           for l in loans])
-            if del_c != "—" and st.button("Delete selected"):
-                del_id    = int(del_c.split()[0].replace("#", ""))
-                new_loans = [l for l in loans if l["id"] != del_id]
-                save_pledge_config({"loans": new_loans})
-                if sheets_ok():
-                    save_pledge_to_sheet(new_loans)
-                st.rerun()
 
 
 # ═════════════════════════════════════════════════════════════════════════════

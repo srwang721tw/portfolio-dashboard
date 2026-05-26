@@ -311,6 +311,62 @@ def save_pledge_config(config: Dict):
         pass
 
 
+def load_tw_transactions() -> List[Dict]:
+    """
+    Load TW transaction history for running-position P&L calculations.
+    Returns list of {symbol, date (str YYYY-MM-DD), share_delta, cost_flow}.
+    Only available when the CSV is in 對帳單 format.
+    """
+    path = TW_CSV_FILE if TW_CSV_FILE.exists() else SAMPLE_TW_CSV
+    df_raw = _read_csv(path)
+    if df_raw is None or not _is_dazhangdan(df_raw):
+        return []
+    try:
+        df = df_raw.copy()
+        df.columns = df.columns.str.strip()
+        df['股名'] = df['股名'].str.strip()
+        df['代號'] = df['股名'].map(TW_NAME_TO_TICKER)
+        df = df.dropna(subset=['代號'])
+
+        df['日期'] = pd.to_datetime(df['日期'], errors='coerce')
+        df['成交股數'] = _clean_num(df['成交股數'])
+        df['淨收付']   = _clean_num(df['淨收付'])
+        df = df.dropna(subset=['日期', '成交股數', '淨收付'])
+
+        # Apply per-ticker date filters (same cutoffs as _parse_dazhangdan)
+        frames = []
+        for ticker, since in TW_INCLUDE_FROM.items():
+            mask = df['代號'] == ticker
+            if since:
+                mask &= df['日期'] >= pd.Timestamp(since)
+            chunk = df[mask]
+            if not chunk.empty:
+                frames.append(chunk)
+
+        if not frames:
+            return []
+
+        filtered = pd.concat(frames, ignore_index=True)
+        filtered['is_buy']      = filtered['淨收付'] < 0
+        filtered['share_delta'] = filtered.apply(
+            lambda r: r['成交股數'] if r['is_buy'] else -r['成交股數'], axis=1
+        )
+        filtered['cost_flow'] = filtered['淨收付'].abs()
+        filtered.loc[~filtered['is_buy'], 'cost_flow'] *= -1
+
+        txns = []
+        for _, row in filtered.iterrows():
+            txns.append({
+                'symbol':      row['代號'],
+                'date':        row['日期'].strftime('%Y-%m-%d'),
+                'share_delta': float(row['share_delta']),
+                'cost_flow':   float(row['cost_flow']),
+            })
+        return txns
+    except Exception:
+        return []
+
+
 def _sample_tw_holdings() -> List[Dict]:
     return [
         {'symbol': '0050',   'name': '元大台灣50',       'shares': 1000,  'cost_per_share': 155.0, 'currency': 'TWD'},

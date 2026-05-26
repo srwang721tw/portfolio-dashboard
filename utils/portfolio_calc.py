@@ -3,6 +3,58 @@ import pandas as pd
 import numpy as np
 
 
+def _tw_running_frame(sym: str, price_history: pd.DataFrame,
+                      txn_df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """
+    Compute per-symbol TW P&L using the actual running position from transactions.
+
+    At each price date we use:
+      - shares_at_date  = cumulative sum of share_delta up to that date
+      - cost_at_date    = cumulative sum of cost_flow  up to that date
+      - pnl_at_date     = shares_at_date * price - cost_at_date
+
+    Returns a DataFrame indexed by price dates with columns
+    {sym}_val, {sym}_cost, {sym}_pnl — or None if no transactions for this symbol.
+    """
+    sym_txns = txn_df[txn_df['symbol'] == sym].copy()
+    if sym_txns.empty:
+        return None
+
+    sym_txns['date'] = pd.to_datetime(sym_txns['date']).dt.normalize()
+
+    # Daily cumulative position
+    daily = sym_txns.groupby('date').agg({'share_delta': 'sum', 'cost_flow': 'sum'})
+    cum   = daily.cumsum()
+
+    # Clean price series
+    prices = price_history.iloc[:, 0].copy()
+    prices.index = pd.to_datetime(prices.index).normalize()
+    prices = prices[~prices.index.duplicated(keep='last')].sort_index()
+
+    if prices.empty or cum.empty:
+        return None
+    if cum.index.min() > prices.index.max():
+        return None  # all transactions are in the future relative to price window
+
+    # Build a full daily index so forward-fill works across weekends/holidays
+    start    = min(cum.index.min(), prices.index.min())
+    full_idx = pd.date_range(start=start, end=prices.index.max(), freq='D')
+
+    cum_full     = cum.reindex(full_idx).ffill().fillna(0)
+    cum_at_price = cum_full.reindex(prices.index).ffill().fillna(0)
+
+    mask = cum_at_price['share_delta'] > 0
+    if not mask.any():
+        return None
+
+    result = pd.DataFrame(index=prices.index[mask])
+    result[f'{sym}_val']  = (prices[mask].values
+                              * cum_at_price.loc[mask, 'share_delta'].values)
+    result[f'{sym}_cost'] = cum_at_price.loc[mask, 'cost_flow'].values
+    result[f'{sym}_pnl']  = result[f'{sym}_val'] - result[f'{sym}_cost']
+    return result
+
+
 def enrich_holdings(
     holdings: List[Dict],
     prices: Dict[str, Optional[float]],
@@ -81,24 +133,48 @@ def compute_portfolio_history(
     us_price_history: Dict[str, pd.DataFrame],
     usd_twd_history: pd.Series,
     days: int = 180,
+    tw_transactions: Optional[List[Dict]] = None,
 ) -> pd.DataFrame:
     """
     Compute daily portfolio value and unrealized P&L from historical prices.
-    Returns DataFrame with columns: date, total_value_twd, total_cost_twd, total_pnl_twd, pnl_pct
+
+    When tw_transactions is provided (list of {symbol, date, share_delta, cost_flow}),
+    TW stocks use the actual running position at each historical date instead of the
+    current shares/cost.  US stocks always use the current snapshot (no tx history).
+
+    Returns DataFrame with columns: date, total_value_twd, total_cost_twd, total_pnl_twd,
+    pnl_pct, daily_pnl_change
     """
     frames = []
 
+    # Build transaction DataFrame once (if available)
+    txn_df: Optional[pd.DataFrame] = None
+    if tw_transactions:
+        txn_df = pd.DataFrame(tw_transactions)
+        if txn_df.empty or 'symbol' not in txn_df.columns:
+            txn_df = None
+
     for h in tw_holdings:
         sym = h["symbol"]
-        if sym in tw_price_history and not tw_price_history[sym].empty:
-            df = tw_price_history[sym].copy()
-            df.columns = [sym]
-            df["value"] = df[sym] * h["shares"]
-            df["cost"] = h["shares"] * h["cost_per_share"]
-            df["pnl"] = df["value"] - df["cost"]
-            frames.append(df[["value", "cost", "pnl"]].rename(
-                columns={"value": f"{sym}_val", "cost": f"{sym}_cost", "pnl": f"{sym}_pnl"}
-            ))
+        if sym not in tw_price_history or tw_price_history[sym].empty:
+            continue
+
+        # ── Transaction-based running position ──────────────────────────────
+        if txn_df is not None:
+            frame = _tw_running_frame(sym, tw_price_history[sym], txn_df)
+            if frame is not None:
+                frames.append(frame)
+                continue
+
+        # ── Fallback: current holdings × historical price ────────────────────
+        df = tw_price_history[sym].copy()
+        df.columns = [sym]
+        df["value"] = df[sym] * h["shares"]
+        df["cost"] = h["shares"] * h["cost_per_share"]
+        df["pnl"] = df["value"] - df["cost"]
+        frames.append(df[["value", "cost", "pnl"]].rename(
+            columns={"value": f"{sym}_val", "cost": f"{sym}_cost", "pnl": f"{sym}_pnl"}
+        ))
 
     for h in us_holdings:
         sym = h["symbol"]
