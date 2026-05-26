@@ -26,9 +26,11 @@ def _tw_running_frame(sym: str, price_history: pd.DataFrame,
     daily = sym_txns.groupby('date').agg({'share_delta': 'sum', 'cost_flow': 'sum'})
     cum   = daily.cumsum()
 
-    # Clean price series
+    # Clean price series — strip tz so we can compare with tz-naive tx dates
     prices = price_history.iloc[:, 0].copy()
     prices.index = pd.to_datetime(prices.index).normalize()
+    if prices.index.tz is not None:
+        prices.index = prices.index.tz_localize(None)
     prices = prices[~prices.index.duplicated(keep='last')].sort_index()
 
     if prices.empty or cum.empty:
@@ -168,6 +170,9 @@ def compute_portfolio_history(
 
         # ── Fallback: current holdings × historical price ────────────────────
         df = tw_price_history[sym].copy()
+        df.index = pd.to_datetime(df.index).normalize()
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
         df.columns = [sym]
         df["value"] = df[sym] * h["shares"]
         df["cost"] = h["shares"] * h["cost_per_share"]
@@ -180,9 +185,16 @@ def compute_portfolio_history(
         sym = h["symbol"]
         if sym in us_price_history and not us_price_history[sym].empty:
             df = us_price_history[sym].copy()
+            df.index = pd.to_datetime(df.index).normalize()
+            if df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
             df.columns = [sym]
-            # Align FX rate
-            fx = usd_twd_history.reindex(df.index, method="ffill").fillna(32.0)
+            # Align FX rate (strip tz from usd_h index too)
+            usd_idx = usd_twd_history.copy()
+            usd_idx.index = pd.to_datetime(usd_idx.index).normalize()
+            if usd_idx.index.tz is not None:
+                usd_idx.index = usd_idx.index.tz_localize(None)
+            fx = usd_idx.reindex(df.index, method="ffill").fillna(32.0)
             df["value"] = df[sym] * h["shares"] * fx
             df["cost"] = h["shares"] * h["cost_per_share"] * fx
             df["pnl"] = df["value"] - df["cost"]
