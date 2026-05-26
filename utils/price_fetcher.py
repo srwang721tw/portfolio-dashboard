@@ -42,6 +42,28 @@ def fetch_current_prices(symbols: Tuple[str, ...]) -> Dict[str, Optional[float]]
 
 @st.cache_data(ttl=PRICE_CACHE_TTL, show_spinner=False)
 def fetch_usd_twd_rate() -> float:
+    """USD/TWD rate. Primary: Cathay Bank digital-channel buying rate. Fallback: yfinance."""
+    try:
+        import requests
+        url = "https://www.cathaybk.com.tw/cathaybk/personal/product/deposit/currency-billboard/"
+        headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+        res    = requests.get(url, headers=headers, timeout=6)
+        tables = pd.read_html(res.text)
+        for tbl in tables:
+            for col in tbl.columns:
+                mask = tbl[col].astype(str).str.contains("數位通路優惠匯率", na=False)
+                if mask.any():
+                    buy_col = next(
+                        (c for c in tbl.columns if "買進" in str(c) or "buy" in str(c).lower()),
+                        None,
+                    )
+                    if buy_col is not None:
+                        val = tbl.loc[mask, buy_col].iloc[0]
+                        return float(str(val).replace(",", ""))
+    except Exception:
+        pass
+    # Fallback: yfinance
     try:
         hist = yf.Ticker("USDTWD=X").history(period="5d")
         if not hist.empty:
