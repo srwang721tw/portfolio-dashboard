@@ -36,6 +36,10 @@ US_TICKERS = {
 PRICE_CACHE_TTL = 900       # 15 minutes
 HISTORY_CACHE_TTL = 3600    # 1 hour
 
+# Actual TWD amount invested in US stocks (bank transfer total).
+# Update this whenever you add more US funds.
+US_TWD_COST_BASIS = 2_188_129
+
 # Pledge thresholds
 PLEDGE_CRITICAL = 140.0     # Margin call
 PLEDGE_WARNING = 200.0      # Warning

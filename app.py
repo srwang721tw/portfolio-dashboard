@@ -15,6 +15,7 @@ from config.settings import (
     COLOR_POSITIVE, COLOR_NEGATIVE, COLOR_NEUTRAL, COLOR_WARNING, COLOR_PURPLE,
     PLEDGE_CRITICAL, PLEDGE_WARNING, PLEDGE_SAFE,
     TW_TICKERS, US_TICKERS, TW_CSV_FILE, US_CSV_FILE,
+    US_TWD_COST_BASIS,
 )
 from utils.auth import (
     has_users, create_user, verify_password, verify_totp,
@@ -135,7 +136,8 @@ def dc(v):
 # ── Cached history helper (hashable args via JSON) ────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def _cached_history(tw_json: str, us_json: str, days: int,
-                    tw_txn_json: str = "[]") -> pd.DataFrame:
+                    tw_txn_json: str = "[]",
+                    us_cost_twd: float = 0.0) -> pd.DataFrame:
     tw_h   = json.loads(tw_json)
     us_h   = json.loads(us_json)
     tw_txn = json.loads(tw_txn_json)
@@ -143,7 +145,8 @@ def _cached_history(tw_json: str, us_json: str, days: int,
     us_ph  = {h["symbol"]: fetch_historical_prices(h["symbol"], days) for h in us_h}
     usd_h  = fetch_usd_twd_history(days)
     return compute_portfolio_history(tw_h, us_h, tw_ph, us_ph, usd_h, days,
-                                     tw_transactions=tw_txn)
+                                     tw_transactions=tw_txn,
+                                     us_cost_twd=us_cost_twd)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -236,6 +239,8 @@ def _chart_pie(df: pd.DataFrame, value_col: str, label_col: str,
     n    = len(df)
     clrs = (colors or PALETTE)[:n]
 
+    # `order` encoding controls pie stack order in Vega-Lite:
+    # descending → largest slice first → starts at 12 o'clock clockwise.
     base = alt.Chart(df).encode(
         theta=alt.Theta(f"{value_col}:Q", stack=True),
         color=alt.Color(
@@ -243,6 +248,7 @@ def _chart_pie(df: pd.DataFrame, value_col: str, label_col: str,
             scale=alt.Scale(range=clrs, domain=df[label_col].tolist()),
             legend=None,
         ),
+        order=alt.Order(f"{value_col}:Q", sort="descending"),
     )
 
     pie = base.mark_arc(outerRadius=120, padAngle=0.02).encode(
@@ -340,6 +346,30 @@ def _chart_pnl_bars(series: pd.Series, title: str):
     ).properties(height=260, title=title)
 
 
+def _chart_pnl_bars_daily(series: pd.Series, title: str):
+    """Green/red bar chart for daily P&L — ordinal x-axis with M/D labels, no overlap."""
+    df = series.reset_index()
+    df.columns = ["date", "pnl"]
+    df["color"]    = df["pnl"].apply(lambda x: COLOR_POSITIVE if x >= 0 else COLOR_NEGATIVE)
+    df["date_str"] = pd.to_datetime(df["date"]).dt.strftime("%-m/%-d")
+    sort_order     = df["date_str"].tolist()   # preserve chronological order
+
+    return (
+        alt.Chart(df).mark_bar(width={"band": 0.65}).encode(
+            x=alt.X("date_str:O", sort=sort_order, title=None,
+                    axis=alt.Axis(labelAngle=-45, labelOverlap=True)),
+            y=alt.Y("pnl:Q", title="NT$", axis=alt.Axis(format=".3~s")),
+            color=alt.Color("color:N", scale=None, legend=None),
+            tooltip=[
+                alt.Tooltip("date_str:O", title="Date"),
+                alt.Tooltip("pnl:Q", format="+,.0f", title="NT$"),
+            ],
+        )
+        + alt.Chart(pd.DataFrame([{"y": 0}])).mark_rule(
+            color="rgba(255,255,255,0.2)").encode(y="y:Q")
+    ).properties(height=260, title=title)
+
+
 def _chart_pnl_categorical(df_cat: pd.DataFrame, x_col: str, title: str):
     """Bar chart with categorical x-axis (months, years)."""
     df_cat = df_cat.copy()
@@ -417,8 +447,26 @@ def render_dashboard():
         prices  = fetch_current_prices(all_syms)
         usd_twd = fetch_usd_twd_rate()
 
-    tw_e    = enrich_holdings(tw_h, prices, usd_twd)
-    us_e    = enrich_holdings(us_h, prices, usd_twd)
+    tw_e = enrich_holdings(tw_h, prices, usd_twd)
+    us_e = enrich_holdings(us_h, prices, usd_twd)
+
+    # ── Override US cost basis with actual TWD invested ───────────────────────
+    # The 複委託庫存 avg_cost is in USD; the real TWD cost is US_TWD_COST_BASIS.
+    # Distribute it proportionally by each symbol's USD cost share.
+    if US_TWD_COST_BASIS > 0:
+        _us_usd_total = sum(h["cost_basis"] or 0 for h in us_e)
+        if _us_usd_total > 0:
+            for h in us_e:
+                _frac               = (h["cost_basis"] or 0) / _us_usd_total
+                h["cost_basis_twd"] = US_TWD_COST_BASIS * _frac
+                h["unrealized_pnl_twd"] = (
+                    (h["market_value_twd"] or 0) - h["cost_basis_twd"]
+                )
+                h["pnl_pct"] = (
+                    h["unrealized_pnl_twd"] / h["cost_basis_twd"] * 100
+                    if h["cost_basis_twd"] > 0 else 0.0
+                )
+
     summary = portfolio_summary(tw_e, us_e)
     if summary["total_value_twd"] > 0:
         save_snapshot(summary["total_value_twd"], summary["total_pnl_twd"],
@@ -628,33 +676,32 @@ def _section_pnl_history(tw_h, us_h):
     st.markdown("<div class='section-title'>P&L Change History</div>",
                 unsafe_allow_html=True)
 
-    tw_json    = json.dumps(tw_h)
-    us_json    = json.dumps(us_h)
+    tw_json     = json.dumps(tw_h)
+    us_json     = json.dumps(us_h)
     tw_txn_json = json.dumps(load_tw_transactions())
+    _us_cost    = float(US_TWD_COST_BASIS)   # pass fixed TWD cost to history calc
 
-    h1, h2, h3 = st.tabs(["📅 Daily (60d)", "📆 Monthly (This Year)", "📊 Annual (3Y)"])
+    h1, h2, h3 = st.tabs(["📅 Daily (30d)", "📆 Monthly (This Year)", "📊 Annual (3Y)"])
 
     with h1:
         with st.spinner("Loading price history…"):
-            df90 = _cached_history(tw_json, us_json, 90, tw_txn_json)
-        if df90.empty:
+            df60 = _cached_history(tw_json, us_json, 60, tw_txn_json, _us_cost)
+        if df60.empty:
             st.info("No data yet."); return
 
-        # Chart A — absolute unrealized P&L level
-        pnl_level = df90["total_pnl_twd"].dropna().tail(60)
-        _render(_chart_pnl_level(pnl_level,
-                                  "Unrealized P&L Level (last 60 trading days)"))
+        # Chart A — absolute unrealized P&L level (last 30 trading days)
+        pnl_level = df60["total_pnl_twd"].dropna().tail(30)
+        _render(_chart_pnl_level(pnl_level, "Unrealized P&L Level (last 30 trading days)"))
 
-        # Chart B — daily P&L change (delta)
-        daily = df90["daily_pnl_change"].dropna()
-        _render(_chart_pnl_bars(daily.tail(60),
-                                 "Daily P&L Change — day-over-day delta"))
+        # Chart B — daily delta bar chart with M/D ordinal x-axis
+        daily = df60["daily_pnl_change"].dropna().tail(30)
+        _render(_chart_pnl_bars_daily(daily, "Daily P&L Change — day-over-day delta"))
         _stats_row(daily)
 
     with h2:
         with st.spinner("Loading monthly data…"):
             this_year = datetime.now(_TZ8).year
-            df_yr = _cached_history(tw_json, us_json, 365, tw_txn_json)
+            df_yr = _cached_history(tw_json, us_json, 365, tw_txn_json, _us_cost)
         if df_yr.empty:
             st.info("No data yet."); return
         monthly = (df_yr["daily_pnl_change"]
@@ -670,15 +717,16 @@ def _section_pnl_history(tw_h, us_h):
 
     with h3:
         with st.spinner("Loading 3-year history (first load may take ~10 s)…"):
-            df3y = _cached_history(tw_json, us_json, 1095, tw_txn_json)
+            df3y = _cached_history(tw_json, us_json, 1095, tw_txn_json, _us_cost)
         if df3y.empty:
             st.info("No data yet."); return
-        annual = df3y["daily_pnl_change"].dropna().resample("YS").sum()
+        # Only keep exactly 3 years (avoid partial 4th year)
+        annual = df3y["daily_pnl_change"].dropna().resample("YS").sum().tail(3)
         df_a = pd.DataFrame({
             "year": annual.index.strftime("%Y"),
             "pnl":  annual.values,
         })
-        _render(_chart_pnl_categorical(df_a, "year", "Annual P&L Change (last 3 years)"))
+        _render(_chart_pnl_categorical(df_a, "year", "Annual P&L Change (3 years)"))
         _stats_row(annual)
 
 
@@ -698,7 +746,7 @@ def _stats_row(series: pd.Series):
 # Pledge helpers
 # ─────────────────────────────────────────────────────────────────────────────
 _PLEDGE_COLS = ["Description", "Loan Amount (TWD)", "Rate (%)",
-                "Date", "Symbol", "Shares", "Currency"]
+                "Start Date", "Expiry Date", "Symbol", "Shares", "Currency"]
 
 
 def _loans_to_df(loans) -> pd.DataFrame:
@@ -707,10 +755,11 @@ def _loans_to_df(loans) -> pd.DataFrame:
     for loan in loans:
         for ps in loan.get("pledged_stocks", []):
             rows.append({
-                "Description":      loan.get("description", ""),
+                "Description":       loan.get("description", ""),
                 "Loan Amount (TWD)": int(loan.get("loan_amount_twd", 0)),
                 "Rate (%)":          float(loan.get("interest_rate", 0.0)),
-                "Date":              loan.get("date", ""),
+                "Start Date":        loan.get("date", ""),
+                "Expiry Date":       loan.get("expiry_date", ""),
                 "Symbol":            ps.get("symbol", ""),
                 "Shares":            int(ps.get("shares", 0)),
                 "Currency":          ps.get("currency", "TWD"),
@@ -724,14 +773,13 @@ def _df_to_loans(df: pd.DataFrame):
     if df.empty:
         return []
     df = df.copy()
-    # Drop rows without a description
     df["Description"] = df["Description"].astype(str).str.strip()
     df = df[df["Description"] != ""]
     df = df[df["Description"] != "nan"]
 
-    loans    = []
-    loan_id  = 1
-    seen     = {}          # description → index in loans list
+    loans   = []
+    loan_id = 1
+    seen    = {}    # description → index in loans list
 
     for _, row in df.iterrows():
         desc   = str(row["Description"]).strip()
@@ -747,7 +795,8 @@ def _df_to_loans(df: pd.DataFrame):
                 "pledged_stocks":   [],
                 "loan_amount_twd":  float(row.get("Loan Amount (TWD)", 0) or 0),
                 "interest_rate":    float(row.get("Rate (%)", 0.0) or 0.0),
-                "date":             str(row.get("Date", "") or ""),
+                "date":             str(row.get("Start Date", "") or ""),
+                "expiry_date":      str(row.get("Expiry Date", "") or ""),
             })
             loan_id += 1
         loans[seen[desc]]["pledged_stocks"].append({
@@ -788,8 +837,10 @@ def _section_pledge(prices, usd_twd):
                 "Loan Amount (TWD)", min_value=0, step=10000, format="%d"),
             "Rate (%)":          st.column_config.NumberColumn(
                 "Rate (%)", min_value=0.0, max_value=20.0, step=0.1, format="%.2f"),
-            "Date":              st.column_config.TextColumn(
-                "Date", help="YYYY-MM-DD"),
+            "Start Date":        st.column_config.TextColumn(
+                "Start Date", help="YYYY-MM-DD"),
+            "Expiry Date":       st.column_config.TextColumn(
+                "Expiry Date", help="YYYY-MM-DD (leave blank if open-ended)"),
             "Symbol":            st.column_config.SelectboxColumn(
                 "Symbol", options=ALL_SYMS + [""], required=True),
             "Shares":            st.column_config.NumberColumn(
@@ -821,7 +872,6 @@ def _section_pledge(prices, usd_twd):
         return
 
     st.markdown("<div style='margin-top:12px'></div>", unsafe_allow_html=True)
-    st.caption("**Live Maintenance Ratios**")
 
     p_syms   = tuple({s["symbol"] for loan in loans
                       for s in loan.get("pledged_stocks", [])})
@@ -830,10 +880,14 @@ def _section_pledge(prices, usd_twd):
     rows               = []
     total_pledge_value = 0.0
     total_loan_amount  = 0.0
+    total_accrued      = 0.0
 
     for loan in loans:
-        ratio, p_value = compute_pledge_ratio(
-            loan["pledged_stocks"], p_prices, loan["loan_amount_twd"], usd_twd
+        start_date = loan.get("date", "")
+        ratio, p_value, accrued = compute_pledge_ratio(
+            loan["pledged_stocks"], p_prices, loan["loan_amount_twd"], usd_twd,
+            interest_rate=loan.get("interest_rate", 0.0),
+            start_date=start_date,
         )
         stocks_str = ", ".join(
             f"{_sym(s['symbol'], s.get('currency','TWD'))}×{s['shares']:,}"
@@ -841,6 +895,7 @@ def _section_pledge(prices, usd_twd):
         )
         total_pledge_value += p_value or 0
         total_loan_amount  += loan["loan_amount_twd"]
+        total_accrued      += accrued
 
         if ratio is None:
             status = "⚠️ N/A"
@@ -854,39 +909,44 @@ def _section_pledge(prices, usd_twd):
             status = "🟢 Safe"
 
         rows.append({
-            "Description":    loan["description"],
-            "Pledged Stocks": stocks_str,
-            "Pledged Value":  fmt(p_value) if p_value else "—",
-            "Loan Amount":    fmt(loan["loan_amount_twd"]),
+            "Date":           start_date,
+            "Expiry":         loan.get("expiry_date", "—") or "—",
+            "Stocks":         stocks_str,
             "Rate":           f"{loan.get('interest_rate', 0):.1f}%",
-            "Ratio":          f"{ratio:.1f}%" if ratio is not None else "—",
+            "Loan Amt":       fmt(loan["loan_amount_twd"]),
+            "Interest":       fmt(accrued) if accrued > 0.5 else "—",
+            "Maint. Ratio":   f"{ratio:.1f}%" if ratio is not None else "—",
             "Status":         status,
         })
 
-    # Overall row
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # ── Highlighted overall account maintenance ratio ─────────────────────────
     overall_ratio = None
     if total_loan_amount > 0:
-        overall_ratio = total_pledge_value / total_loan_amount * 100
+        overall_ratio = total_pledge_value / (total_loan_amount + total_accrued) * 100
         if overall_ratio < PLEDGE_CRITICAL:
-            ov_status = "🔴 MARGIN CALL"
+            ov_color, ov_label = COLOR_NEGATIVE, "🔴 MARGIN CALL"
         elif overall_ratio < PLEDGE_WARNING:
-            ov_status = "🟠 Warning"
+            ov_color, ov_label = COLOR_WARNING,  "🟠 Warning"
         elif overall_ratio < PLEDGE_SAFE:
-            ov_status = "🟡 Watch"
+            ov_color, ov_label = COLOR_NEUTRAL,  "🟡 Watch"
         else:
-            ov_status = "🟢 Safe"
-        rows.append({
-            "Description":    "**Overall**",
-            "Pledged Stocks": "",
-            "Pledged Value":  fmt(total_pledge_value),
-            "Loan Amount":    fmt(total_loan_amount),
-            "Rate":           "",
-            "Ratio":          f"{overall_ratio:.1f}%",
-            "Status":         ov_status,
-        })
+            ov_color, ov_label = COLOR_POSITIVE, "🟢 Safe"
 
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    if overall_ratio is not None:
+        st.markdown(
+            f"<div style='margin-top:10px;padding:14px 20px;border-radius:10px;"
+            f"border:2px solid {ov_color};background:rgba(0,0,0,0.25)'>"
+            f"<span style='font-size:0.8rem;color:#8B949E'>Account Maintenance Ratio</span><br>"
+            f"<span style='font-size:2rem;font-weight:700;color:{ov_color}'>"
+            f"{overall_ratio:.1f}%</span>"
+            f"&nbsp;&nbsp;<span style='font-size:1rem'>{ov_label}</span><br>"
+            f"<span style='font-size:0.75rem;color:#8B949E'>"
+            f"Pledged {fmt(total_pledge_value)} / Liability {fmt(total_loan_amount + total_accrued)} "
+            f"(principal {fmt(total_loan_amount)} + interest {fmt(total_accrued)})"
+            f"</span></div>",
+            unsafe_allow_html=True,
+        )
         _render(_chart_pledge_gauge(overall_ratio), height=100)
 
 

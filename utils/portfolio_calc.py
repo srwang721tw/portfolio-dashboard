@@ -136,13 +136,15 @@ def compute_portfolio_history(
     usd_twd_history: pd.Series,
     days: int = 180,
     tw_transactions: Optional[List[Dict]] = None,
+    us_cost_twd: float = 0.0,
 ) -> pd.DataFrame:
     """
     Compute daily portfolio value and unrealized P&L from historical prices.
 
-    When tw_transactions is provided (list of {symbol, date, share_delta, cost_flow}),
-    TW stocks use the actual running position at each historical date instead of the
-    current shares/cost.  US stocks always use the current snapshot (no tx history).
+    tw_transactions: if provided, TW stocks use actual running position from transactions.
+    us_cost_twd: if > 0, use this fixed TWD amount as the total US cost basis
+                 (the actual TWD invested), distributed proportionally by USD cost.
+                 This prevents FX fluctuations from distorting the US cost line.
 
     Returns DataFrame with columns: date, total_value_twd, total_cost_twd, total_pnl_twd,
     pnl_pct, daily_pnl_change
@@ -181,26 +183,39 @@ def compute_portfolio_history(
             columns={"value": f"{sym}_val", "cost": f"{sym}_cost", "pnl": f"{sym}_pnl"}
         ))
 
+    # Pre-compute FX series once (tz-stripped)
+    usd_idx = usd_twd_history.copy()
+    usd_idx.index = pd.to_datetime(usd_idx.index).normalize()
+    if usd_idx.index.tz is not None:
+        usd_idx.index = usd_idx.index.tz_localize(None)
+
+    # Total US USD cost for proportional distribution of us_cost_twd
+    _us_usd_total = sum(h["shares"] * h["cost_per_share"] for h in us_holdings)
+
     for h in us_holdings:
         sym = h["symbol"]
-        if sym in us_price_history and not us_price_history[sym].empty:
-            df = us_price_history[sym].copy()
-            df.index = pd.to_datetime(df.index).normalize()
-            if df.index.tz is not None:
-                df.index = df.index.tz_localize(None)
-            df.columns = [sym]
-            # Align FX rate (strip tz from usd_h index too)
-            usd_idx = usd_twd_history.copy()
-            usd_idx.index = pd.to_datetime(usd_idx.index).normalize()
-            if usd_idx.index.tz is not None:
-                usd_idx.index = usd_idx.index.tz_localize(None)
-            fx = usd_idx.reindex(df.index, method="ffill").fillna(32.0)
-            df["value"] = df[sym] * h["shares"] * fx
+        if sym not in us_price_history or us_price_history[sym].empty:
+            continue
+        df = us_price_history[sym].copy()
+        df.index = pd.to_datetime(df.index).normalize()
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+        df.columns = [sym]
+
+        fx = usd_idx.reindex(df.index, method="ffill").fillna(32.0)
+        df["value"] = df[sym] * h["shares"] * fx
+
+        if us_cost_twd > 0 and _us_usd_total > 0:
+            # Fixed TWD cost: proportional share of the actual TWD invested
+            frac       = (h["shares"] * h["cost_per_share"]) / _us_usd_total
+            df["cost"] = us_cost_twd * frac   # constant; not affected by FX drift
+        else:
             df["cost"] = h["shares"] * h["cost_per_share"] * fx
-            df["pnl"] = df["value"] - df["cost"]
-            frames.append(df[["value", "cost", "pnl"]].rename(
-                columns={"value": f"{sym}_val", "cost": f"{sym}_cost", "pnl": f"{sym}_pnl"}
-            ))
+
+        df["pnl"] = df["value"] - df["cost"]
+        frames.append(df[["value", "cost", "pnl"]].rename(
+            columns={"value": f"{sym}_val", "cost": f"{sym}_cost", "pnl": f"{sym}_pnl"}
+        ))
 
     if not frames:
         return pd.DataFrame()
@@ -230,21 +245,39 @@ def compute_pledge_ratio(
     prices: Dict[str, Optional[float]],
     loan_twd: float,
     usd_twd: float = 32.0,
-) -> Tuple[Optional[float], float]:
+    interest_rate: float = 0.0,
+    start_date: str = "",
+) -> Tuple[Optional[float], float, float]:
     """
-    Returns (ratio_pct, pledged_value_twd).
+    Returns (ratio_pct, pledged_value_twd, accrued_interest_twd).
+
+    Maintenance ratio = pledged_value / (principal + accrued_interest) × 100%.
+    Accrued interest   = principal × rate/100 × days_elapsed/365.
     pledged_stocks: [{"symbol": ..., "shares": ..., "currency": "TWD"|"USD"}]
     """
+    from datetime import date as _date
+
     total_value = 0.0
     for ps in pledged_stocks:
         price = prices.get(ps["symbol"])
         if price is None:
-            return None, 0.0
+            return None, 0.0, 0.0
         fx = usd_twd if ps.get("currency") == "USD" else 1.0
         total_value += ps["shares"] * price * fx
 
-    if loan_twd <= 0:
-        return None, total_value
+    # Accrued interest
+    accrued = 0.0
+    if interest_rate > 0 and start_date and loan_twd > 0:
+        try:
+            start       = _date.fromisoformat(start_date)
+            days_elapsed = max(0, (_date.today() - start).days)
+            accrued     = loan_twd * interest_rate / 100 * days_elapsed / 365
+        except Exception:
+            pass
 
-    ratio = total_value / loan_twd * 100
-    return ratio, total_value
+    total_liability = loan_twd + accrued
+    if total_liability <= 0:
+        return None, total_value, accrued
+
+    ratio = total_value / total_liability * 100
+    return ratio, total_value, accrued
