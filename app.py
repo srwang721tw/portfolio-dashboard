@@ -774,86 +774,114 @@ def _stats_row(series: pd.Series):
 # ─────────────────────────────────────────────────────────────────────────────
 # Pledge helpers
 # ─────────────────────────────────────────────────────────────────────────────
-_PLEDGE_COLS = ["Description", "Loan Amount (TWD)", "Rate (%)",
-                "Start Date", "Expiry Date", "Symbol", "Shares", "Currency",
-                "Current Interest (TWD)"]
+# Columns shown in the edit table (Description + Currency removed).
+# Each row = one pledged stock / loan entry.
+_PLEDGE_COLS = [
+    "Loan Amount (TWD)", "Rate (%)", "Start Date", "Expiry Date",
+    "Symbol", "Shares", "Current Interest (TWD)",
+]
+
+_TW_PLEDGE_SYMS = list(TW_TICKERS.keys())   # only TW stocks can be pledged
+
+
+def _parse_date(s):
+    """String → datetime.date; None if blank/invalid."""
+    from datetime import date as _d
+    if not s or str(s).strip().lower() in ("", "none", "nat", "nan", "pd.nat"):
+        return None
+    try:
+        return _d.fromisoformat(str(s)[:10])
+    except Exception:
+        return None
+
+
+def _date_to_str(v) -> str:
+    """datetime.date / Timestamp / string → 'YYYY-MM-DD'; '' if empty."""
+    if v is None:
+        return ""
+    try:
+        if isinstance(v, float) and pd.isna(v):
+            return ""
+        if hasattr(v, "strftime"):
+            return v.strftime("%Y-%m-%d")
+        s = str(v)[:10]
+        return s if len(s) == 10 else ""
+    except Exception:
+        return ""
 
 
 def _compute_loan_interest(loan_twd: float, rate: float, start_date: str) -> float:
-    """Compute accrued interest: principal × rate% × days_elapsed / 365."""
+    """Compute interest: principal × rate% × days_elapsed / 365."""
     if rate > 0 and start_date and loan_twd > 0:
         try:
             from datetime import date as _d
-            start        = _d.fromisoformat(start_date)
-            days_elapsed = max(0, (_d.today() - start).days)
-            return loan_twd * rate / 100 * days_elapsed / 365
+            days = max(0, (_d.today() - _d.fromisoformat(start_date)).days)
+            return loan_twd * rate / 100 * days / 365
         except Exception:
             pass
     return 0.0
 
 
 def _loans_to_df(loans) -> pd.DataFrame:
-    """Expand loan list to a flat DataFrame — one row per pledged stock."""
+    """
+    Expand loan list → flat DataFrame, one row per pledged stock.
+    Current Interest shows the stored manual override value; if none was saved,
+    falls back to the auto-computed amount so the user has a sensible default.
+    Dates are returned as datetime.date objects so Streamlit shows a date picker.
+    """
     rows = []
     for loan in loans:
-        interest = _compute_loan_interest(
-            loan.get("loan_amount_twd", 0),
-            loan.get("interest_rate", 0.0),
-            loan.get("date", ""),
-        )
+        # Prefer stored manual interest; fall back to auto-computed default
+        stored_interest = loan.get("override_interest_twd")
+        if stored_interest is not None:
+            interest = float(stored_interest)
+        else:
+            interest = _compute_loan_interest(
+                loan.get("loan_amount_twd", 0),
+                loan.get("interest_rate", 0.0),
+                loan.get("date", ""),
+            )
         for ps in loan.get("pledged_stocks", []):
             rows.append({
-                "Description":            loan.get("description", ""),
                 "Loan Amount (TWD)":      int(loan.get("loan_amount_twd", 0)),
                 "Rate (%)":               float(loan.get("interest_rate", 0.0)),
-                "Start Date":             loan.get("date", ""),
-                "Expiry Date":            loan.get("expiry_date", ""),
+                "Start Date":             _parse_date(loan.get("date", "")),
+                "Expiry Date":            _parse_date(loan.get("expiry_date", "")),
                 "Symbol":                 ps.get("symbol", ""),
                 "Shares":                 int(ps.get("shares", 0)),
-                "Currency":               ps.get("currency", "TWD"),
                 "Current Interest (TWD)": int(round(interest)),
             })
-    return pd.DataFrame(rows, columns=_PLEDGE_COLS) if rows else pd.DataFrame(
-        columns=_PLEDGE_COLS)
+    return (
+        pd.DataFrame(rows, columns=_PLEDGE_COLS) if rows
+        else pd.DataFrame(columns=_PLEDGE_COLS)
+    )
 
 
 def _df_to_loans(df: pd.DataFrame):
-    """Collapse flat DataFrame back to loan list (groups by Description)."""
+    """
+    Convert flat DataFrame back to loan list.
+    Each row becomes its own loan (one pledged stock per loan).
+    Currency is always TWD (TW stocks only).
+    """
     if df.empty:
         return []
-    df = df.copy()
-    df["Description"] = df["Description"].astype(str).str.strip()
-    df = df[df["Description"] != ""]
-    df = df[df["Description"] != "nan"]
-
-    loans   = []
-    loan_id = 1
-    seen    = {}    # description → index in loans list
-
-    for _, row in df.iterrows():
-        desc   = str(row["Description"]).strip()
+    loans = []
+    for i, row in df.iterrows():
         sym    = str(row.get("Symbol", "")).strip().upper()
         shares = int(row.get("Shares", 0) or 0)
-        if not desc or not sym or shares <= 0:
+        if not sym or shares <= 0:
             continue
-        if desc not in seen:
-            seen[desc] = len(loans)
-            loans.append({
-                "id":               loan_id,
-                "description":      desc,
-                "pledged_stocks":   [],
-                "loan_amount_twd":  float(row.get("Loan Amount (TWD)", 0) or 0),
-                "interest_rate":    float(row.get("Rate (%)", 0.0) or 0.0),
-                "date":             str(row.get("Start Date", "") or ""),
-                "expiry_date":      str(row.get("Expiry Date", "") or ""),
-            })
-            loan_id += 1
-        loans[seen[desc]]["pledged_stocks"].append({
-            "symbol":   sym,
-            "shares":   shares,
-            "currency": str(row.get("Currency", "TWD") or "TWD"),
+        loans.append({
+            "id":                    len(loans) + 1,
+            "description":           f"{sym} Pledge {len(loans) + 1}",
+            "pledged_stocks":        [{"symbol": sym, "shares": shares,
+                                       "currency": "TWD"}],
+            "loan_amount_twd":       float(row.get("Loan Amount (TWD)", 0) or 0),
+            "interest_rate":         float(row.get("Rate (%)", 0.0) or 0.0),
+            "date":                  _date_to_str(row.get("Start Date")),
+            "expiry_date":           _date_to_str(row.get("Expiry Date")),
+            "override_interest_twd": float(row.get("Current Interest (TWD)", 0) or 0),
         })
-
     return loans
 
 
@@ -886,11 +914,13 @@ def _section_pledge(prices, usd_twd):
         any_price_missing    = False
 
         for loan in loans:
+            stored = loan.get("override_interest_twd")
             ratio, p_value, accrued = compute_pledge_ratio(
                 loan["pledged_stocks"], p_prices,
                 loan["loan_amount_twd"], usd_twd,
                 interest_rate=loan.get("interest_rate", 0.0),
                 start_date=loan.get("date", ""),
+                override_accrued=float(stored) if stored is not None else None,
             )
             if ratio is None:
                 any_price_missing = True
@@ -966,37 +996,37 @@ def _section_pledge(prices, usd_twd):
     st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
     with st.expander("✏️ Edit Loan Configuration", expanded=(not loans)):
         st.caption(
-            "One row per pledged stock. Rows with the same **Description** are grouped "
-            "into one loan. Use **＋** to add rows; select a row + **Delete** to remove."
+            "One row per pledged stock. Use **＋** to add rows; "
+            "select a row + **Delete** to remove. "
+            "Click any date cell to open a calendar picker."
         )
 
-        ALL_SYMS = list(TW_TICKERS.keys()) + list(US_TICKERS.keys())
-
+        from datetime import date as _dt_today
         edited_df = st.data_editor(
             _loans_to_df(loans),
             num_rows="dynamic",
             column_config={
-                "Description":       st.column_config.TextColumn(
-                    "Description", required=True, help="Loan name / label"),
                 "Loan Amount (TWD)": st.column_config.NumberColumn(
-                    "Loan Amount (TWD)", min_value=0, step=10000, format="%d"),
+                    "Loan Amount (TWD)", min_value=0, step=10_000, format="%d"),
                 "Rate (%)":          st.column_config.NumberColumn(
-                    "Rate (%)", min_value=0.0, max_value=20.0, step=0.01, format="%.2f"),
-                "Start Date":        st.column_config.TextColumn(
-                    "Start Date", help="YYYY-MM-DD"),
-                "Expiry Date":       st.column_config.TextColumn(
-                    "Expiry Date", help="YYYY-MM-DD (leave blank if open-ended)"),
+                    "Rate (%)", min_value=0.0, max_value=20.0,
+                    step=0.01, format="%.2f"),
+                "Start Date":        st.column_config.DateColumn(
+                    "Start Date",
+                    format="YYYY-MM-DD",
+                    help="Click to pick a date"),
+                "Expiry Date":       st.column_config.DateColumn(
+                    "Expiry Date",
+                    format="YYYY-MM-DD",
+                    help="Leave blank if open-ended"),
                 "Symbol":            st.column_config.SelectboxColumn(
-                    "Symbol", options=ALL_SYMS + [""], required=True),
+                    "Symbol", options=_TW_PLEDGE_SYMS + [""], required=True),
                 "Shares":            st.column_config.NumberColumn(
                     "Shares", min_value=0, step=100, format="%d"),
-                "Currency":          st.column_config.SelectboxColumn(
-                    "Currency", options=["TWD", "USD"], required=True),
                 "Current Interest (TWD)": st.column_config.NumberColumn(
-                    "Current Interest (TWD)",
-                    help="Auto-computed from Loan × Rate × Days / 365 (read-only)"),
+                    "Current Interest (TWD)", min_value=0, step=100, format="%d",
+                    help="Enter the actual accrued interest amount (TWD)"),
             },
-            disabled=["Current Interest (TWD)"],
             use_container_width=True,
             hide_index=True,
             key="pledge_editor",

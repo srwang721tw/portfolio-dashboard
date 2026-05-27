@@ -251,12 +251,14 @@ def compute_pledge_ratio(
     usd_twd: float = 32.0,
     interest_rate: float = 0.0,
     start_date: str = "",
+    override_accrued: Optional[float] = None,
 ) -> Tuple[Optional[float], float, float]:
     """
     Returns (ratio_pct, pledged_value_twd, accrued_interest_twd).
 
     Maintenance ratio = pledged_value / (principal + accrued_interest) × 100%.
-    Accrued interest   = principal × rate/100 × days_elapsed/365.
+    override_accrued: if provided, use this directly as the interest amount
+                      instead of computing from rate/days (manual input mode).
     pledged_stocks: [{"symbol": ..., "shares": ..., "currency": "TWD"|"USD"}]
     """
     from datetime import date as _date
@@ -269,15 +271,18 @@ def compute_pledge_ratio(
         fx = usd_twd if ps.get("currency") == "USD" else 1.0
         total_value += ps["shares"] * price * fx
 
-    # Accrued interest
-    accrued = 0.0
-    if interest_rate > 0 and start_date and loan_twd > 0:
+    # Interest: manual override takes priority; otherwise compute from rate/days
+    if override_accrued is not None:
+        accrued = float(override_accrued)
+    elif interest_rate > 0 and start_date and loan_twd > 0:
         try:
-            start       = _date.fromisoformat(start_date)
+            start        = _date.fromisoformat(start_date)
             days_elapsed = max(0, (_date.today() - start).days)
-            accrued     = loan_twd * interest_rate / 100 * days_elapsed / 365
+            accrued      = loan_twd * interest_rate / 100 * days_elapsed / 365
         except Exception:
-            pass
+            accrued = 0.0
+    else:
+        accrued = 0.0
 
     total_liability = loan_twd + accrued
     if total_liability <= 0:

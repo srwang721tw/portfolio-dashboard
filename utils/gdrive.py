@@ -56,8 +56,9 @@ def _folder() -> str:
 
 def upload(local_path: Path) -> bool:
     """
-    Upload a local file to Drive.
-    Only UPDATES existing files (service accounts cannot create on personal Drive).
+    Upload a local file to the configured Drive folder.
+    Creates the file if it doesn't exist; updates it if it does.
+    Storage counts against the service account's own quota (15 GB default).
     """
     svc = _service()
     if not svc or not local_path.exists():
@@ -72,10 +73,16 @@ def upload(local_path: Path) -> bool:
             .execute()
             .get("files", [])
         )
-        if not existing:
-            return False  # File must be pre-created by folder owner (see setup_drive.py)
         media = MediaFileUpload(str(local_path), resumable=False)
-        svc.files().update(fileId=existing[0]["id"], media_body=media).execute()
+        if existing:
+            svc.files().update(fileId=existing[0]["id"], media_body=media).execute()
+        else:
+            # First upload — create the file in the Drive folder
+            svc.files().create(
+                body={"name": name, "parents": [fid]},
+                media_body=media,
+                fields="id",
+            ).execute()
         return True
     except Exception:
         return False
