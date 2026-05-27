@@ -413,7 +413,7 @@ def _chart_pledge_gauge(ratio: float):
         + alt.Chart(val_df).mark_text(dy=-36, fontSize=20, fontWeight="bold",
                                        color="white").encode(
             x=alt.X("r:Q", scale=sc),
-            text=alt.Text("r:Q", format=".1f"),
+            text=alt.Text("r:Q", format=".2f"),
         )
     ).properties(height=100)
 
@@ -775,23 +775,43 @@ def _stats_row(series: pd.Series):
 # Pledge helpers
 # ─────────────────────────────────────────────────────────────────────────────
 _PLEDGE_COLS = ["Description", "Loan Amount (TWD)", "Rate (%)",
-                "Start Date", "Expiry Date", "Symbol", "Shares", "Currency"]
+                "Start Date", "Expiry Date", "Symbol", "Shares", "Currency",
+                "Current Interest (TWD)"]
+
+
+def _compute_loan_interest(loan_twd: float, rate: float, start_date: str) -> float:
+    """Compute accrued interest: principal × rate% × days_elapsed / 365."""
+    if rate > 0 and start_date and loan_twd > 0:
+        try:
+            from datetime import date as _d
+            start        = _d.fromisoformat(start_date)
+            days_elapsed = max(0, (_d.today() - start).days)
+            return loan_twd * rate / 100 * days_elapsed / 365
+        except Exception:
+            pass
+    return 0.0
 
 
 def _loans_to_df(loans) -> pd.DataFrame:
     """Expand loan list to a flat DataFrame — one row per pledged stock."""
     rows = []
     for loan in loans:
+        interest = _compute_loan_interest(
+            loan.get("loan_amount_twd", 0),
+            loan.get("interest_rate", 0.0),
+            loan.get("date", ""),
+        )
         for ps in loan.get("pledged_stocks", []):
             rows.append({
-                "Description":       loan.get("description", ""),
-                "Loan Amount (TWD)": int(loan.get("loan_amount_twd", 0)),
-                "Rate (%)":          float(loan.get("interest_rate", 0.0)),
-                "Start Date":        loan.get("date", ""),
-                "Expiry Date":       loan.get("expiry_date", ""),
-                "Symbol":            ps.get("symbol", ""),
-                "Shares":            int(ps.get("shares", 0)),
-                "Currency":          ps.get("currency", "TWD"),
+                "Description":            loan.get("description", ""),
+                "Loan Amount (TWD)":      int(loan.get("loan_amount_twd", 0)),
+                "Rate (%)":               float(loan.get("interest_rate", 0.0)),
+                "Start Date":             loan.get("date", ""),
+                "Expiry Date":            loan.get("expiry_date", ""),
+                "Symbol":                 ps.get("symbol", ""),
+                "Shares":                 int(ps.get("shares", 0)),
+                "Currency":               ps.get("currency", "TWD"),
+                "Current Interest (TWD)": int(round(interest)),
             })
     return pd.DataFrame(rows, columns=_PLEDGE_COLS) if rows else pd.DataFrame(
         columns=_PLEDGE_COLS)
@@ -905,7 +925,7 @@ def _section_pledge(prices, usd_twd):
                 r_delta, r_dc = "🟡 Watch",         "off"
             else:
                 r_delta, r_dc = "🟢 Safe",          "normal"
-            m3.metric("Overall Maintenance Ratio", f"{overall_ratio:.1f}%",
+            m3.metric("Overall Maintenance Ratio", f"{overall_ratio:.2f}%",
                       r_delta, delta_color=r_dc)
         else:
             m3.metric("Overall Maintenance Ratio",
@@ -933,7 +953,7 @@ def _section_pledge(prices, usd_twd):
                     "Rate (%)":        f"{loan.get('interest_rate', 0):.2f}%",
                     "Loan Amount":     fmt(loan["loan_amount_twd"]),
                     "Current Interest":fmt(accrued) if accrued > 0.5 else "NT$0",
-                    "Maint. Ratio":    f"{ratio:.1f}%" if ratio is not None else "—",
+                    "Maint. Ratio":    f"{ratio:.2f}%" if ratio is not None else "—",
                 })
         if rows:
             st.markdown("<div style='margin-top:8px'></div>", unsafe_allow_html=True)
@@ -961,7 +981,7 @@ def _section_pledge(prices, usd_twd):
                 "Loan Amount (TWD)": st.column_config.NumberColumn(
                     "Loan Amount (TWD)", min_value=0, step=10000, format="%d"),
                 "Rate (%)":          st.column_config.NumberColumn(
-                    "Rate (%)", min_value=0.0, max_value=20.0, step=0.1, format="%.2f"),
+                    "Rate (%)", min_value=0.0, max_value=20.0, step=0.01, format="%.2f"),
                 "Start Date":        st.column_config.TextColumn(
                     "Start Date", help="YYYY-MM-DD"),
                 "Expiry Date":       st.column_config.TextColumn(
@@ -972,7 +992,11 @@ def _section_pledge(prices, usd_twd):
                     "Shares", min_value=0, step=100, format="%d"),
                 "Currency":          st.column_config.SelectboxColumn(
                     "Currency", options=["TWD", "USD"], required=True),
+                "Current Interest (TWD)": st.column_config.NumberColumn(
+                    "Current Interest (TWD)",
+                    help="Auto-computed from Loan × Rate × Days / 365 (read-only)"),
             },
+            disabled=["Current Interest (TWD)"],
             use_container_width=True,
             hide_index=True,
             key="pledge_editor",
