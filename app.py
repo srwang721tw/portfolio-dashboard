@@ -7,6 +7,7 @@ import streamlit as st
 import altair as alt
 import pandas as pd
 from datetime import datetime, date, timezone, timedelta
+from streamlit_autorefresh import st_autorefresh
 
 _TZ8 = timezone(timedelta(hours=8))   # UTC+8 (Asia/Taipei)
 
@@ -25,7 +26,6 @@ from utils.auth import (
 from utils.data_loader import (
     load_tw_holdings, load_us_holdings,
     load_pledge_config, save_pledge_config,
-    load_tw_transactions,
 )
 from utils.price_fetcher import (
     fetch_current_prices, fetch_usd_twd_rate,
@@ -107,26 +107,21 @@ def _sym(symbol: str, currency: str = "TWD") -> str:
 
 
 def fmt(v, prefix="NT$") -> str:
+    """Format a monetary value as a plain integer with comma separator."""
     if v is None:
         return "—"
-    av = abs(v)
-    if av >= 1_000_000:
-        return f"{prefix}{v/1_000_000:+.2f}M" if v < 0 else f"{prefix}{v/1_000_000:.2f}M"
-    if av >= 1_000:
-        return f"{prefix}{v/1_000:+.1f}K" if v < 0 else f"{prefix}{v/1_000:.1f}K"
-    return f"{prefix}{v:,.0f}"
+    if v < 0:
+        return f"-{prefix}{int(round(abs(v))):,}"
+    return f"{prefix}{int(round(v)):,}"
 
 
 def fmtpnl(v, prefix="NT$") -> str:
-    """Always show sign for P&L values."""
+    """Format P&L — always show sign, plain integer."""
     if v is None:
         return "—"
-    av = abs(v)
-    if av >= 1_000_000:
-        return f"{'+' if v>=0 else ''}{prefix}{v/1_000_000:.2f}M"
-    if av >= 1_000:
-        return f"{'+' if v>=0 else ''}{prefix}{v/1_000:.1f}K"
-    return f"{'+' if v>=0 else ''}{prefix}{v:,.0f}"
+    if v >= 0:
+        return f"+{prefix}{int(round(v)):,}"
+    return f"-{prefix}{int(round(abs(v))):,}"
 
 
 def dc(v):
@@ -427,6 +422,9 @@ def _chart_pledge_gauge(ratio: float):
 # DASHBOARD
 # ═════════════════════════════════════════════════════════════════════════════
 def render_dashboard():
+    # ── Auto-refresh prices every 5 minutes ───────────────────────────────────
+    st_autorefresh(interval=300_000, key="px_autorefresh")
+
     # ── One-time Drive sync ───────────────────────────────────────────────────
     if not st.session_state.get("_gdrive_synced"):
         with st.spinner("Syncing data..."):
@@ -477,7 +475,7 @@ def render_dashboard():
     pnl_30d = get_pnl_change(30)
 
     # ── Header ────────────────────────────────────────────────────────────────
-    h1, h2 = st.columns([5, 1])
+    h1, h2 = st.columns([6, 1])
     with h1:
         _now8 = datetime.now(_TZ8).strftime('%Y/%m/%d %H:%M')
         st.markdown(
@@ -487,18 +485,8 @@ def render_dashboard():
             f"&nbsp;&nbsp;USD/TWD: {usd_twd:.2f} (Cathay)</div>",
             unsafe_allow_html=True)
     with h2:
-        bc1, bc2 = st.columns(2)
-        with bc1:
-            if st.button("⟳", use_container_width=True, help="Refresh prices"):
-                st.cache_data.clear(); st.rerun()
-        with bc2:
-            if st.button("👤", use_container_width=True, help="Account settings"):
-                st.session_state._show_profile = not st.session_state.get(
-                    "_show_profile", False)
-                st.rerun()
-
-    if st.session_state.get("_show_profile"):
-        _profile_panel()
+        if st.button("Sign Out", use_container_width=True, type="secondary"):
+            logout(); st.rerun()
 
     st.markdown("<div class='divider'></div>", unsafe_allow_html=True)
 
@@ -520,8 +508,9 @@ def render_dashboard():
 
     st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
 
-    # ── Two tabs ──────────────────────────────────────────────────────────────
-    tab_dash, tab_upload = st.tabs(["📊 Dashboard", "📤 Upload"])
+    # ── Three tabs ────────────────────────────────────────────────────────────
+    tab_dash, tab_upload, tab_account = st.tabs(
+        ["📊 Dashboard", "📤 Upload", "👤 Account"])
 
     with tab_dash:
         _section_charts(tw_e, us_e, summary)
@@ -532,38 +521,47 @@ def render_dashboard():
     with tab_upload:
         _tab_upload()
 
+    with tab_account:
+        _tab_account()
 
-# ── Profile panel ─────────────────────────────────────────────────────────────
-def _profile_panel():
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB: Account settings (password change, profile info)
+# ═════════════════════════════════════════════════════════════════════════════
+def _tab_account():
     uname   = st.session_state.username
     profile = get_profile(uname)
-    with st.container(border=True):
-        st.markdown(f"#### 👤 Account Settings — {uname}")
-        c1, c2 = st.columns(2)
-        with c1:
-            with st.form("profile_form"):
-                new_email = st.text_input("Email", value=profile.get("email", ""))
-                new_pw    = st.text_input("New password (leave blank to keep)",
-                                          type="password")
-                new_pw2   = st.text_input("Confirm new password", type="password")
-                if st.form_submit_button("Save", type="primary"):
-                    if new_pw and new_pw != new_pw2:
-                        st.error("Passwords do not match")
-                    else:
-                        update_profile(uname, new_password=new_pw or None,
-                                       new_email=new_email)
-                        st.success("Saved!")
-                        st.session_state._show_profile = False
-                        st.rerun()
-        with c2:
-            st.caption("2FA status")
-            st.write("✅ Enabled" if profile.get("totp_enabled") else "❌ Disabled")
-            st.caption("Logged in as")
-            st.write(uname)
-            if st.button("Close", use_container_width=True):
-                st.session_state._show_profile = False; st.rerun()
-            if st.button("Sign Out", use_container_width=True, type="secondary"):
-                logout(); st.rerun()
+
+    st.markdown("<div class='section-title'>Account Settings</div>",
+                unsafe_allow_html=True)
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        st.markdown(f"**Change Password — {uname}**")
+        with st.form("account_pw_form"):
+            new_email = st.text_input("Email", value=profile.get("email", ""))
+            new_pw    = st.text_input("New password (leave blank to keep)",
+                                      type="password")
+            new_pw2   = st.text_input("Confirm new password", type="password")
+            if st.form_submit_button("Save Changes", type="primary",
+                                     use_container_width=True):
+                if new_pw and len(new_pw) < 8:
+                    st.error("Password must be at least 8 characters")
+                elif new_pw and new_pw != new_pw2:
+                    st.error("Passwords do not match")
+                else:
+                    update_profile(uname,
+                                   new_password=new_pw or None,
+                                   new_email=new_email or None)
+                    st.success("Changes saved!")
+                    st.rerun()
+
+    with c2:
+        st.markdown("**Account Info**")
+        st.write(f"**Username:** {uname}")
+        st.write(f"**2FA:** {'✅ Enabled' if profile.get('totp_enabled') else '❌ Disabled'}")
+        if profile.get("email"):
+            st.write(f"**Email:** {profile['email']}")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -676,16 +674,18 @@ def _section_pnl_history(tw_h, us_h):
     st.markdown("<div class='section-title'>P&L Change History</div>",
                 unsafe_allow_html=True)
 
-    tw_json     = json.dumps(tw_h)
-    us_json     = json.dumps(us_h)
-    tw_txn_json = json.dumps(load_tw_transactions())
-    _us_cost    = float(US_TWD_COST_BASIS)   # pass fixed TWD cost to history calc
+    tw_json  = json.dumps(tw_h)
+    us_json  = json.dumps(us_h)
+    _us_cost = float(US_TWD_COST_BASIS)
+    # Always use current holdings × historical price (long-term buy-and-hold):
+    # pass empty transactions so compute_portfolio_history uses the simple fallback path.
+    _txn_json = "[]"
 
     h1, h2, h3 = st.tabs(["📅 Daily (30d)", "📆 Monthly (This Year)", "📊 Annual (3Y)"])
 
     with h1:
         with st.spinner("Loading price history…"):
-            df60 = _cached_history(tw_json, us_json, 60, tw_txn_json, _us_cost)
+            df60 = _cached_history(tw_json, us_json, 60, _txn_json, _us_cost)
         if df60.empty:
             st.info("No data yet."); return
 
@@ -693,20 +693,22 @@ def _section_pnl_history(tw_h, us_h):
         pnl_level = df60["total_pnl_twd"].dropna().tail(30)
         _render(_chart_pnl_level(pnl_level, "Unrealized P&L Level (last 30 trading days)"))
 
-        # Chart B — daily delta bar chart with M/D ordinal x-axis
-        daily = df60["daily_pnl_change"].dropna().tail(30)
+        # Chart B — daily delta (day-over-day difference of the P&L level)
+        daily = df60["total_pnl_twd"].dropna().diff().dropna().tail(30)
         _render(_chart_pnl_bars_daily(daily, "Daily P&L Change — day-over-day delta"))
         _stats_row(daily)
 
     with h2:
         with st.spinner("Loading monthly data…"):
             this_year = datetime.now(_TZ8).year
-            df_yr = _cached_history(tw_json, us_json, 365, tw_txn_json, _us_cost)
+            df_yr     = _cached_history(tw_json, us_json, 365, _txn_json, _us_cost)
         if df_yr.empty:
             st.info("No data yet."); return
-        monthly = (df_yr["daily_pnl_change"]
-                   .dropna()[df_yr.index.year == this_year]
-                   .resample("MS").sum())
+        # Monthly P&L change = end-of-month P&L level minus previous month-end level
+        monthly_all = df_yr["total_pnl_twd"].dropna().resample("ME").last().diff().dropna()
+        monthly     = monthly_all[monthly_all.index.year == this_year]
+        if monthly.empty:
+            st.info("No monthly data for this year yet."); return
         df_m = pd.DataFrame({
             "month": monthly.index.strftime("%b"),
             "pnl":   monthly.values,
@@ -717,11 +719,12 @@ def _section_pnl_history(tw_h, us_h):
 
     with h3:
         with st.spinner("Loading 3-year history (first load may take ~10 s)…"):
-            df3y = _cached_history(tw_json, us_json, 1095, tw_txn_json, _us_cost)
+            df3y = _cached_history(tw_json, us_json, 1095, _txn_json, _us_cost)
         if df3y.empty:
             st.info("No data yet."); return
-        # Only keep exactly 3 years (avoid partial 4th year)
-        annual = df3y["daily_pnl_change"].dropna().resample("YS").sum().tail(3)
+        # Annual P&L change = end-of-year P&L level minus previous year-end level
+        annual = (df3y["total_pnl_twd"].dropna()
+                  .resample("YE").last().diff().dropna().tail(3))
         df_a = pd.DataFrame({
             "year": annual.index.strftime("%Y"),
             "pnl":  annual.values,
@@ -817,7 +820,85 @@ def _section_pledge(prices, usd_twd):
     st.markdown("<div class='section-title'>Pledge Monitoring</div>",
                 unsafe_allow_html=True)
 
-    # ── Editable pledge definition table ─────────────────────────────────────
+    # ── Compute live metrics from currently-saved config ──────────────────────
+    total_pledge_value   = 0.0
+    total_loan_principal = 0.0
+    total_accrued        = 0.0
+    loan_data            = []   # (loan, ratio, p_value, accrued)
+
+    if loans:
+        p_syms   = tuple({s["symbol"] for loan in loans
+                          for s in loan.get("pledged_stocks", [])})
+        p_prices = fetch_current_prices(p_syms) if p_syms else {}
+
+        for loan in loans:
+            ratio, p_value, accrued = compute_pledge_ratio(
+                loan["pledged_stocks"], p_prices,
+                loan["loan_amount_twd"], usd_twd,
+                interest_rate=loan.get("interest_rate", 0.0),
+                start_date=loan.get("date", ""),
+            )
+            total_pledge_value   += p_value or 0
+            total_loan_principal += loan["loan_amount_twd"]
+            total_accrued        += accrued
+            loan_data.append((loan, ratio, p_value, accrued))
+
+        total_liability = total_loan_principal + total_accrued
+        overall_ratio   = (
+            total_pledge_value / total_liability * 100
+            if total_liability > 0 else None
+        )
+
+        # ── Top 3 highlighted metrics ─────────────────────────────────────────
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Pledged Stock Value", fmt(total_pledge_value))
+        m2.metric(
+            "Total Liability (w/ Interest)",
+            fmt(total_liability),
+            f"Interest: {fmt(total_accrued)}",
+            delta_color="off",
+        )
+        if overall_ratio is not None:
+            if overall_ratio < PLEDGE_CRITICAL:
+                r_delta, r_dc = "🔴 MARGIN CALL", "inverse"
+            elif overall_ratio < PLEDGE_WARNING:
+                r_delta, r_dc = "🟠 Warning",      "inverse"
+            elif overall_ratio < PLEDGE_SAFE:
+                r_delta, r_dc = "🟡 Watch",         "off"
+            else:
+                r_delta, r_dc = "🟢 Safe",          "normal"
+            m3.metric("Overall Maint. Ratio", f"{overall_ratio:.1f}%",
+                      r_delta, delta_color=r_dc)
+        else:
+            m3.metric("Overall Maint. Ratio", "—")
+
+        # ── Per-stock monitoring table (one row per pledged stock per loan) ───
+        rows = []
+        for loan, ratio, p_value, accrued in loan_data:
+            for ps in loan.get("pledged_stocks", []):
+                sym      = ps["symbol"]
+                shares   = ps.get("shares", 0)
+                currency = ps.get("currency", "TWD")
+                rows.append({
+                    "Date":         loan.get("date", ""),
+                    "Expiry":       loan.get("expiry_date", "") or "—",
+                    "Symbol":       _sym(sym, currency),
+                    "Shares":       f"{shares:,}",
+                    "Rate (%)":     f"{loan.get('interest_rate', 0):.2f}%",
+                    "Loan Amount":  fmt(loan["loan_amount_twd"]),
+                    "Interest":     fmt(accrued) if accrued > 0.5 else "NT$0",
+                    "Maint. Ratio": f"{ratio:.1f}%" if ratio is not None else "—",
+                })
+        if rows:
+            st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        # ── Gauge chart ────────────────────────────────────────────────────────
+        if overall_ratio is not None:
+            _render(_chart_pledge_gauge(overall_ratio), height=100)
+
+    # ── Editable pledge definition table ──────────────────────────────────────
+    st.markdown("<div style='margin-top:16px'></div>", unsafe_allow_html=True)
     st.caption(
         "Edit loans below — one row per pledged stock. "
         "Rows sharing the same **Description** are grouped into one loan. "
@@ -856,7 +937,6 @@ def _section_pledge(prices, usd_twd):
     if st.button("💾  Save Pledge Data", type="primary"):
         new_loans = _df_to_loans(edited_df)
         save_pledge_config({"loans": new_loans})
-        # Also sync to gsheets if configured
         try:
             from utils.gsheets import is_configured as sheets_ok, save_pledge_to_sheet
             if sheets_ok():
@@ -864,90 +944,6 @@ def _section_pledge(prices, usd_twd):
         except Exception:
             pass
         st.success("Saved!"); st.rerun()
-
-    # ── Live monitoring table (read-only, computed from live prices) ───────────
-    # Reload after potential save
-    loans = load_pledge_config().get("loans", [])
-    if not loans:
-        return
-
-    st.markdown("<div style='margin-top:12px'></div>", unsafe_allow_html=True)
-
-    p_syms   = tuple({s["symbol"] for loan in loans
-                      for s in loan.get("pledged_stocks", [])})
-    p_prices = fetch_current_prices(p_syms) if p_syms else {}
-
-    rows               = []
-    total_pledge_value = 0.0
-    total_loan_amount  = 0.0
-    total_accrued      = 0.0
-
-    for loan in loans:
-        start_date = loan.get("date", "")
-        ratio, p_value, accrued = compute_pledge_ratio(
-            loan["pledged_stocks"], p_prices, loan["loan_amount_twd"], usd_twd,
-            interest_rate=loan.get("interest_rate", 0.0),
-            start_date=start_date,
-        )
-        stocks_str = ", ".join(
-            f"{_sym(s['symbol'], s.get('currency','TWD'))}×{s['shares']:,}"
-            for s in loan.get("pledged_stocks", [])
-        )
-        total_pledge_value += p_value or 0
-        total_loan_amount  += loan["loan_amount_twd"]
-        total_accrued      += accrued
-
-        if ratio is None:
-            status = "⚠️ N/A"
-        elif ratio < PLEDGE_CRITICAL:
-            status = "🔴 MARGIN CALL"
-        elif ratio < PLEDGE_WARNING:
-            status = "🟠 Warning"
-        elif ratio < PLEDGE_SAFE:
-            status = "🟡 Watch"
-        else:
-            status = "🟢 Safe"
-
-        rows.append({
-            "Date":           start_date,
-            "Expiry":         loan.get("expiry_date", "—") or "—",
-            "Stocks":         stocks_str,
-            "Rate":           f"{loan.get('interest_rate', 0):.1f}%",
-            "Loan Amt":       fmt(loan["loan_amount_twd"]),
-            "Interest":       fmt(accrued) if accrued > 0.5 else "—",
-            "Maint. Ratio":   f"{ratio:.1f}%" if ratio is not None else "—",
-            "Status":         status,
-        })
-
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-    # ── Highlighted overall account maintenance ratio ─────────────────────────
-    overall_ratio = None
-    if total_loan_amount > 0:
-        overall_ratio = total_pledge_value / (total_loan_amount + total_accrued) * 100
-        if overall_ratio < PLEDGE_CRITICAL:
-            ov_color, ov_label = COLOR_NEGATIVE, "🔴 MARGIN CALL"
-        elif overall_ratio < PLEDGE_WARNING:
-            ov_color, ov_label = COLOR_WARNING,  "🟠 Warning"
-        elif overall_ratio < PLEDGE_SAFE:
-            ov_color, ov_label = COLOR_NEUTRAL,  "🟡 Watch"
-        else:
-            ov_color, ov_label = COLOR_POSITIVE, "🟢 Safe"
-
-        st.markdown(
-            f"<div style='margin-top:10px;padding:14px 20px;border-radius:10px;"
-            f"border:2px solid {ov_color};background:rgba(0,0,0,0.25)'>"
-            f"<span style='font-size:0.8rem;color:#8B949E'>Account Maintenance Ratio</span><br>"
-            f"<span style='font-size:2rem;font-weight:700;color:{ov_color}'>"
-            f"{overall_ratio:.1f}%</span>"
-            f"&nbsp;&nbsp;<span style='font-size:1rem'>{ov_label}</span><br>"
-            f"<span style='font-size:0.75rem;color:#8B949E'>"
-            f"Pledged {fmt(total_pledge_value)} / Liability {fmt(total_loan_amount + total_accrued)} "
-            f"(principal {fmt(total_loan_amount)} + interest {fmt(total_accrued)})"
-            f"</span></div>",
-            unsafe_allow_html=True,
-        )
-        _render(_chart_pledge_gauge(overall_ratio), height=100)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
