@@ -838,7 +838,10 @@ def _df_to_loans(df: pd.DataFrame):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SECTION: Pledge Monitoring (editable via st.data_editor)
+# SECTION: Pledge Monitoring
+# Layout:
+#   1. Live monitoring (3 metric highlights + per-stock table + gauge) — always on top
+#   2. Edit loan configuration in a collapsible expander below
 # ═════════════════════════════════════════════════════════════════════════════
 def _section_pledge(prices, usd_twd):
     loans = load_pledge_config().get("loans", [])
@@ -846,16 +849,21 @@ def _section_pledge(prices, usd_twd):
     st.markdown("<div class='section-title'>Pledge Monitoring</div>",
                 unsafe_allow_html=True)
 
-    # ── Compute live metrics from currently-saved config ──────────────────────
-    total_pledge_value   = 0.0
-    total_loan_principal = 0.0
-    total_accrued        = 0.0
-    loan_data            = []   # (loan, ratio, p_value, accrued)
-
-    if loans:
+    # ════════════════════════════════════════════════════════════════════════
+    # Part 1 — LIVE MONITORING (read-only, computed from current prices)
+    # ════════════════════════════════════════════════════════════════════════
+    if not loans:
+        st.info("No pledge loans configured yet. Expand the editor below to add loans.")
+    else:
         p_syms   = tuple({s["symbol"] for loan in loans
                           for s in loan.get("pledged_stocks", [])})
         p_prices = fetch_current_prices(p_syms) if p_syms else {}
+
+        total_pledge_value   = 0.0
+        total_loan_principal = 0.0
+        total_accrued        = 0.0
+        loan_data            = []   # (loan, ratio, p_value, accrued)
+        any_price_missing    = False
 
         for loan in loans:
             ratio, p_value, accrued = compute_pledge_ratio(
@@ -864,6 +872,8 @@ def _section_pledge(prices, usd_twd):
                 interest_rate=loan.get("interest_rate", 0.0),
                 start_date=loan.get("date", ""),
             )
+            if ratio is None:
+                any_price_missing = True
             total_pledge_value   += p_value or 0
             total_loan_principal += loan["loan_amount_twd"]
             total_accrued        += accrued
@@ -872,16 +882,18 @@ def _section_pledge(prices, usd_twd):
         total_liability = total_loan_principal + total_accrued
         overall_ratio   = (
             total_pledge_value / total_liability * 100
-            if total_liability > 0 else None
+            if (total_liability > 0 and not any_price_missing) else None
         )
 
-        # ── Top 3 highlighted metrics ─────────────────────────────────────────
+        # ── Highlight 1: Pledged Stock Value ──────────────────────────────────
+        # ── Highlight 2: Total Loan Amount (incl. interest) ───────────────────
+        # ── Highlight 3: Overall Maintenance Ratio ────────────────────────────
         m1, m2, m3 = st.columns(3)
         m1.metric("Pledged Stock Value", fmt(total_pledge_value))
         m2.metric(
-            "Total Liability (w/ Interest)",
+            "Total Loan Amount (incl. Interest)",
             fmt(total_liability),
-            f"Interest: {fmt(total_accrued)}",
+            f"Interest accrued: {fmt(total_accrued)}",
             delta_color="off",
         )
         if overall_ratio is not None:
@@ -893,12 +905,20 @@ def _section_pledge(prices, usd_twd):
                 r_delta, r_dc = "🟡 Watch",         "off"
             else:
                 r_delta, r_dc = "🟢 Safe",          "normal"
-            m3.metric("Overall Maint. Ratio", f"{overall_ratio:.1f}%",
+            m3.metric("Overall Maintenance Ratio", f"{overall_ratio:.1f}%",
                       r_delta, delta_color=r_dc)
         else:
-            m3.metric("Overall Maint. Ratio", "—")
+            m3.metric("Overall Maintenance Ratio",
+                      "—" if any_price_missing else fmt(0))
+            if any_price_missing:
+                st.caption("⚠️ Some prices unavailable — ratio cannot be calculated")
 
-        # ── Per-stock monitoring table (one row per pledged stock per loan) ───
+        # ── Gauge chart ────────────────────────────────────────────────────────
+        if overall_ratio is not None:
+            _render(_chart_pledge_gauge(overall_ratio), height=100)
+
+        # ── Per-stock monitoring table ─────────────────────────────────────────
+        # Columns: 日期 | 到期日 | 股票代號 | 股數 | 利率 | 借款金額 | 目前利息 | 維持率
         rows = []
         for loan, ratio, p_value, accrued in loan_data:
             for ps in loan.get("pledged_stocks", []):
@@ -906,70 +926,76 @@ def _section_pledge(prices, usd_twd):
                 shares   = ps.get("shares", 0)
                 currency = ps.get("currency", "TWD")
                 rows.append({
-                    "Date":         loan.get("date", ""),
-                    "Expiry":       loan.get("expiry_date", "") or "—",
-                    "Symbol":       _sym(sym, currency),
-                    "Shares":       f"{shares:,}",
-                    "Rate (%)":     f"{loan.get('interest_rate', 0):.2f}%",
-                    "Loan Amount":  fmt(loan["loan_amount_twd"]),
-                    "Interest":     fmt(accrued) if accrued > 0.5 else "NT$0",
-                    "Maint. Ratio": f"{ratio:.1f}%" if ratio is not None else "—",
+                    "Date":            loan.get("date", ""),
+                    "Expiry Date":     loan.get("expiry_date", "") or "—",
+                    "Symbol":          _sym(sym, currency),
+                    "Shares":          f"{shares:,}",
+                    "Rate (%)":        f"{loan.get('interest_rate', 0):.2f}%",
+                    "Loan Amount":     fmt(loan["loan_amount_twd"]),
+                    "Current Interest":fmt(accrued) if accrued > 0.5 else "NT$0",
+                    "Maint. Ratio":    f"{ratio:.1f}%" if ratio is not None else "—",
                 })
         if rows:
-            st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
+            st.markdown("<div style='margin-top:8px'></div>", unsafe_allow_html=True)
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-        # ── Gauge chart ────────────────────────────────────────────────────────
-        if overall_ratio is not None:
-            _render(_chart_pledge_gauge(overall_ratio), height=100)
+    # ════════════════════════════════════════════════════════════════════════
+    # Part 2 — EDIT LOAN CONFIGURATION (collapsible)
+    # Expanded by default when no loans exist, collapsed otherwise.
+    # ════════════════════════════════════════════════════════════════════════
+    st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
+    with st.expander("✏️ Edit Loan Configuration", expanded=(not loans)):
+        st.caption(
+            "One row per pledged stock. Rows with the same **Description** are grouped "
+            "into one loan. Use **＋** to add rows; select a row + **Delete** to remove."
+        )
 
-    # ── Editable pledge definition table ──────────────────────────────────────
-    st.markdown("<div style='margin-top:16px'></div>", unsafe_allow_html=True)
-    st.caption(
-        "Edit loans below — one row per pledged stock. "
-        "Rows sharing the same **Description** are grouped into one loan. "
-        "Click **＋** to add rows; select a row and press **Delete** to remove it. "
-        "Press **Save** when done."
-    )
+        ALL_SYMS = list(TW_TICKERS.keys()) + list(US_TICKERS.keys())
 
-    ALL_SYMS = list(TW_TICKERS.keys()) + list(US_TICKERS.keys())
+        edited_df = st.data_editor(
+            _loans_to_df(loans),
+            num_rows="dynamic",
+            column_config={
+                "Description":       st.column_config.TextColumn(
+                    "Description", required=True, help="Loan name / label"),
+                "Loan Amount (TWD)": st.column_config.NumberColumn(
+                    "Loan Amount (TWD)", min_value=0, step=10000, format="%d"),
+                "Rate (%)":          st.column_config.NumberColumn(
+                    "Rate (%)", min_value=0.0, max_value=20.0, step=0.1, format="%.2f"),
+                "Start Date":        st.column_config.TextColumn(
+                    "Start Date", help="YYYY-MM-DD"),
+                "Expiry Date":       st.column_config.TextColumn(
+                    "Expiry Date", help="YYYY-MM-DD (leave blank if open-ended)"),
+                "Symbol":            st.column_config.SelectboxColumn(
+                    "Symbol", options=ALL_SYMS + [""], required=True),
+                "Shares":            st.column_config.NumberColumn(
+                    "Shares", min_value=0, step=100, format="%d"),
+                "Currency":          st.column_config.SelectboxColumn(
+                    "Currency", options=["TWD", "USD"], required=True),
+            },
+            use_container_width=True,
+            hide_index=True,
+            key="pledge_editor",
+        )
 
-    edited_df = st.data_editor(
-        _loans_to_df(loans),
-        num_rows="dynamic",
-        column_config={
-            "Description":       st.column_config.TextColumn(
-                "Description", required=True, help="Loan name / label"),
-            "Loan Amount (TWD)": st.column_config.NumberColumn(
-                "Loan Amount (TWD)", min_value=0, step=10000, format="%d"),
-            "Rate (%)":          st.column_config.NumberColumn(
-                "Rate (%)", min_value=0.0, max_value=20.0, step=0.1, format="%.2f"),
-            "Start Date":        st.column_config.TextColumn(
-                "Start Date", help="YYYY-MM-DD"),
-            "Expiry Date":       st.column_config.TextColumn(
-                "Expiry Date", help="YYYY-MM-DD (leave blank if open-ended)"),
-            "Symbol":            st.column_config.SelectboxColumn(
-                "Symbol", options=ALL_SYMS + [""], required=True),
-            "Shares":            st.column_config.NumberColumn(
-                "Shares", min_value=0, step=100, format="%d"),
-            "Currency":          st.column_config.SelectboxColumn(
-                "Currency", options=["TWD", "USD"], required=True),
-        },
-        use_container_width=True,
-        hide_index=True,
-        key="pledge_editor",
-    )
-
-    if st.button("💾  Save Pledge Data", type="primary"):
-        new_loans = _df_to_loans(edited_df)
-        save_pledge_config({"loans": new_loans})
-        try:
-            from utils.gsheets import is_configured as sheets_ok, save_pledge_to_sheet
-            if sheets_ok():
-                save_pledge_to_sheet(new_loans)
-        except Exception:
-            pass
-        st.success("Saved!"); st.rerun()
+        if st.button("💾 Save", type="primary", use_container_width=True):
+            new_loans  = _df_to_loans(edited_df)
+            drive_ok   = save_pledge_config({"loans": new_loans})
+            if drive_ok:
+                st.success("✅ Saved and synced to Google Drive")
+            else:
+                try:
+                    from utils.gdrive import is_configured
+                    if is_configured():
+                        st.warning(
+                            "✅ Saved locally — Google Drive upload failed. "
+                            "Make sure the file exists in Drive (run setup_drive.py once)."
+                        )
+                    else:
+                        st.success("✅ Saved locally (Google Drive not configured)")
+                except Exception:
+                    st.success("✅ Saved")
+            st.rerun()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
