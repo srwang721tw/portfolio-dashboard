@@ -7,7 +7,7 @@ import streamlit as st
 import altair as alt
 import pandas as pd
 from datetime import datetime, date, timezone, timedelta
-from streamlit_autorefresh import st_autorefresh
+import streamlit.components.v1 as components
 
 _TZ8 = timezone(timedelta(hours=8))   # UTC+8 (Asia/Taipei)
 
@@ -422,8 +422,11 @@ def _chart_pledge_gauge(ratio: float):
 # DASHBOARD
 # ═════════════════════════════════════════════════════════════════════════════
 def render_dashboard():
-    # ── Auto-refresh prices every 5 minutes ───────────────────────────────────
-    st_autorefresh(interval=300_000, key="px_autorefresh")
+    # ── Auto-refresh prices every 5 minutes (pure JS, no extra package) ─────────
+    components.html(
+        "<script>setTimeout(()=>window.parent.location.reload(),300000)</script>",
+        height=0,
+    )
 
     # ── One-time Drive sync ───────────────────────────────────────────────────
     if not st.session_state.get("_gdrive_synced"):
