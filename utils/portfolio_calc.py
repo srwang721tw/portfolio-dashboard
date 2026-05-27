@@ -221,6 +221,10 @@ def compute_portfolio_history(
         return pd.DataFrame()
 
     combined = pd.concat(frames, axis=1)
+    # Forward-fill so that market-closure days (e.g. TW holiday when US is open)
+    # carry the previous close instead of NaN — prevents those days from being
+    # omitted from the portfolio total when summing across symbols.
+    combined = combined.ffill()
     combined = combined.dropna(how="all")
 
     val_cols = [c for c in combined.columns if c.endswith("_val")]

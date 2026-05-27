@@ -15,7 +15,7 @@ import pandas as pd
 
 from config.settings import (
     TW_CSV_FILE, US_CSV_FILE, SAMPLE_TW_CSV, SAMPLE_US_CSV,
-    PLEDGE_FILE,
+    PLEDGE_FILE, US_COST_CONFIG_FILE, US_TWD_COST_BASIS,
 )
 
 # ── Taiwan stock name → ticker code ──────────────────────────────────────────
@@ -307,6 +307,32 @@ def save_pledge_config(config: Dict):
     try:
         from utils.gdrive import upload
         upload(PLEDGE_FILE)
+    except Exception:
+        pass
+
+
+def load_us_cost_twd() -> float:
+    """Load the actual TWD invested in US stocks. Falls back to the settings constant."""
+    if US_COST_CONFIG_FILE.exists():
+        try:
+            with open(US_COST_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            val = float(data.get("us_twd_cost", 0))
+            if val > 0:
+                return val
+        except Exception:
+            pass
+    return float(US_TWD_COST_BASIS)
+
+
+def save_us_cost_twd(amount: float):
+    """Persist the US TWD cost basis to the config file and sync to Drive."""
+    US_COST_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(US_COST_CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump({"us_twd_cost": float(amount)}, f)
+    try:
+        from utils.gdrive import upload
+        upload(US_COST_CONFIG_FILE)
     except Exception:
         pass
 

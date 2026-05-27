@@ -181,13 +181,15 @@ def sync_down_all():
         return
 
     from config.settings import (
-        USERS_FILE, PLEDGE_FILE, HISTORY_FILE, TW_CSV_FILE, US_CSV_FILE
+        USERS_FILE, PLEDGE_FILE, HISTORY_FILE, TW_CSV_FILE, US_CSV_FILE,
+        US_COST_CONFIG_FILE,
     )
 
     # ── User / config files ────────────────────────────────────────────────
-    download("users.json",             USERS_FILE,   force=True)
-    download("pledge_config.json",     PLEDGE_FILE,  force=False)
-    download("portfolio_history.json", HISTORY_FILE, force=False)
+    download("users.json",             USERS_FILE,           force=True)   # always sync accounts
+    download("pledge_config.json",     PLEDGE_FILE,          force=True)   # always sync pledges
+    download("us_cost_config.json",    US_COST_CONFIG_FILE,  force=True)   # always sync US cost
+    download("portfolio_history.json", HISTORY_FILE,         force=False)
 
     # ── TW stock CSV ───────────────────────────────────────────────────────
     if not download("tw_stocks.csv", TW_CSV_FILE, force=False):

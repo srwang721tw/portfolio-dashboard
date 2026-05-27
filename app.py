@@ -7,7 +7,6 @@ import streamlit as st
 import altair as alt
 import pandas as pd
 from datetime import datetime, date, timezone, timedelta
-import streamlit.components.v1 as components
 
 _TZ8 = timezone(timedelta(hours=8))   # UTC+8 (Asia/Taipei)
 
@@ -16,7 +15,7 @@ from config.settings import (
     COLOR_POSITIVE, COLOR_NEGATIVE, COLOR_NEUTRAL, COLOR_WARNING, COLOR_PURPLE,
     PLEDGE_CRITICAL, PLEDGE_WARNING, PLEDGE_SAFE,
     TW_TICKERS, US_TICKERS, TW_CSV_FILE, US_CSV_FILE,
-    US_TWD_COST_BASIS,
+    PLEDGE_FILE,
 )
 from utils.auth import (
     has_users, create_user, verify_password, verify_totp,
@@ -26,6 +25,7 @@ from utils.auth import (
 from utils.data_loader import (
     load_tw_holdings, load_us_holdings,
     load_pledge_config, save_pledge_config,
+    load_us_cost_twd, save_us_cost_twd,
 )
 from utils.price_fetcher import (
     fetch_current_prices, fetch_usd_twd_rate,
@@ -281,7 +281,7 @@ def _chart_price(hist: pd.DataFrame, sym: str, cost_price=None,
     layers = [
         base.mark_area(color=line_color, opacity=0.08).encode(
             y=alt.Y("price:Q", title=prefix,
-                    axis=alt.Axis(format=".3~s"))),
+                    axis=alt.Axis(format=",.2f"))),
         base.mark_line(color=line_color, strokeWidth=2).encode(y="price:Q"),
     ]
     if cost_price:
@@ -305,14 +305,14 @@ def _chart_pnl_level(series: pd.Series, title: str):
                           color=clr)
     line = base.mark_line(strokeWidth=2, interpolate="monotone",
                           color=clr).encode(
-        y=alt.Y("pnl:Q", title="NT$", axis=alt.Axis(format=".3~s")),
+        y=alt.Y("pnl:Q", title="NT$", axis=alt.Axis(format=",.0f")),
         tooltip=[
             alt.Tooltip("date:T", format="%Y-%m-%d"),
             alt.Tooltip("pnl:Q", format="+,.0f", title="NT$"),
         ],
     )
     area = area.encode(
-        y=alt.Y("pnl:Q", title="NT$", axis=alt.Axis(format=".3~s")),
+        y=alt.Y("pnl:Q", title="NT$", axis=alt.Axis(format=",.0f")),
     )
     zero = alt.Chart(pd.DataFrame([{"y": 0}])).mark_rule(
         color="rgba(255,255,255,0.2)"
@@ -329,7 +329,7 @@ def _chart_pnl_bars(series: pd.Series, title: str):
     return (
         alt.Chart(df).mark_bar(width={"band": 0.75}).encode(
             x=alt.X("date:T", title=None),
-            y=alt.Y("pnl:Q", title="NT$", axis=alt.Axis(format=".3~s")),
+            y=alt.Y("pnl:Q", title="NT$", axis=alt.Axis(format=",.0f")),
             color=alt.Color("color:N", scale=None, legend=None),
             tooltip=[
                 alt.Tooltip("date:T", format="%Y-%m-%d"),
@@ -353,7 +353,7 @@ def _chart_pnl_bars_daily(series: pd.Series, title: str):
         alt.Chart(df).mark_bar(width={"band": 0.65}).encode(
             x=alt.X("date_str:O", sort=sort_order, title=None,
                     axis=alt.Axis(labelAngle=-45, labelOverlap=True)),
-            y=alt.Y("pnl:Q", title="NT$", axis=alt.Axis(format=".3~s")),
+            y=alt.Y("pnl:Q", title="NT$", axis=alt.Axis(format=",.0f")),
             color=alt.Color("color:N", scale=None, legend=None),
             tooltip=[
                 alt.Tooltip("date_str:O", title="Date"),
@@ -375,7 +375,7 @@ def _chart_pnl_categorical(df_cat: pd.DataFrame, x_col: str, title: str):
                                     width={"band": 0.7}).encode(
             x=alt.X(f"{x_col}:N", sort=None, title=None,
                     axis=alt.Axis(labelAngle=-30, labelLimit=60)),
-            y=alt.Y("pnl:Q", title="NT$", axis=alt.Axis(format=".3~s")),
+            y=alt.Y("pnl:Q", title="NT$", axis=alt.Axis(format=",.0f")),
             color=alt.Color("color:N", scale=None, legend=None),
             tooltip=[
                 alt.Tooltip(f"{x_col}:N"),
@@ -422,12 +422,6 @@ def _chart_pledge_gauge(ratio: float):
 # DASHBOARD
 # ═════════════════════════════════════════════════════════════════════════════
 def render_dashboard():
-    # ── Auto-refresh prices every 5 minutes (pure JS, no extra package) ─────────
-    components.html(
-        "<script>setTimeout(()=>window.parent.location.reload(),300000)</script>",
-        height=0,
-    )
-
     # ── One-time Drive sync ───────────────────────────────────────────────────
     if not st.session_state.get("_gdrive_synced"):
         with st.spinner("Syncing data..."):
@@ -438,12 +432,15 @@ def render_dashboard():
                 pass
         st.session_state._gdrive_synced = True
 
+    # ── Load US cost basis (editable, persisted in config file) ──────────────
+    _us_cost_twd = load_us_cost_twd()
+
     # ── Load holdings ─────────────────────────────────────────────────────────
     tw_h = load_tw_holdings()
     us_h = load_us_holdings()
     all_syms = tuple(h["symbol"] for h in tw_h + us_h)
 
-    # ── Fetch prices (with spinner) ───────────────────────────────────────────
+    # ── Fetch prices ──────────────────────────────────────────────────────────
     with st.spinner("Fetching live prices…"):
         prices  = fetch_current_prices(all_syms)
         usd_twd = fetch_usd_twd_rate()
@@ -452,14 +449,14 @@ def render_dashboard():
     us_e = enrich_holdings(us_h, prices, usd_twd)
 
     # ── Override US cost basis with actual TWD invested ───────────────────────
-    # The 複委託庫存 avg_cost is in USD; the real TWD cost is US_TWD_COST_BASIS.
+    # The 複委託庫存 avg_cost is in USD; the real TWD cost is stored in config.
     # Distribute it proportionally by each symbol's USD cost share.
-    if US_TWD_COST_BASIS > 0:
+    if _us_cost_twd > 0:
         _us_usd_total = sum(h["cost_basis"] or 0 for h in us_e)
         if _us_usd_total > 0:
             for h in us_e:
                 _frac               = (h["cost_basis"] or 0) / _us_usd_total
-                h["cost_basis_twd"] = US_TWD_COST_BASIS * _frac
+                h["cost_basis_twd"] = _us_cost_twd * _frac
                 h["unrealized_pnl_twd"] = (
                     (h["market_value_twd"] or 0) - h["cost_basis_twd"]
                 )
@@ -478,7 +475,7 @@ def render_dashboard():
     pnl_30d = get_pnl_change(30)
 
     # ── Header ────────────────────────────────────────────────────────────────
-    h1, h2 = st.columns([6, 1])
+    h1, h2, h3 = st.columns([5, 1.5, 1])
     with h1:
         _now8 = datetime.now(_TZ8).strftime('%Y/%m/%d %H:%M')
         st.markdown(
@@ -488,6 +485,10 @@ def render_dashboard():
             f"&nbsp;&nbsp;USD/TWD: {usd_twd:.2f} (Cathay)</div>",
             unsafe_allow_html=True)
     with h2:
+        if st.button("🔄 Refresh Prices", use_container_width=True, type="secondary"):
+            st.cache_data.clear()
+            st.rerun()
+    with h3:
         if st.button("Sign Out", use_container_width=True, type="secondary"):
             logout(); st.rerun()
 
@@ -517,8 +518,8 @@ def render_dashboard():
 
     with tab_dash:
         _section_charts(tw_e, us_e, summary)
-        _section_holdings(tw_e, us_e)
-        _section_pnl_history(tw_h, us_h)
+        _section_holdings(tw_e, us_e, _us_cost_twd)
+        _section_pnl_history(tw_h, us_h, _us_cost_twd)
         _section_pledge(prices, usd_twd)
 
     with tab_upload:
@@ -604,7 +605,7 @@ def _section_charts(tw_e, us_e, summary):
 # ═════════════════════════════════════════════════════════════════════════════
 # SECTION: Full Holdings Table (with subtotals)
 # ═════════════════════════════════════════════════════════════════════════════
-def _section_holdings(tw_e, us_e):
+def _section_holdings(tw_e, us_e, us_cost_twd: float):
     st.markdown("<div class='section-title'>Portfolio Holdings</div>",
                 unsafe_allow_html=True)
 
@@ -663,23 +664,45 @@ def _section_holdings(tw_e, us_e):
     m1.metric("TW Cost Basis",  fmt(tw_cb))
     m2.metric("TW Market Value", fmt(tw_mv),
               fmtpnl(tw_mv - tw_cb), delta_color=dc(tw_mv - tw_cb))
-    m3.metric("US Cost Basis",  fmt(us_cb))
+    m3.metric("US Cost Basis (TWD)",  fmt(us_cb))
     m4.metric("US Market Value (USD)",
               fmt(sum(h["market_value"] or 0 for h in us_e), prefix="$"),
               fmtpnl(sum(h["unrealized_pnl_twd"] or 0 for h in us_e)),
               delta_color=dc(sum(h["unrealized_pnl_twd"] or 0 for h in us_e)))
 
+    # ── US Cost Basis editor ───────────────────────────────────────────────────
+    with st.expander("⚙️ Update US Cost Basis (TWD)", expanded=False):
+        st.caption(
+            "Enter the total TWD actually transferred to your overseas brokerage. "
+            "This overrides the USD avg-cost × FX calculation and eliminates "
+            "FX-drift noise in your P&L."
+        )
+        with st.form("us_cost_form"):
+            new_cost = st.number_input(
+                "Total TWD invested in US stocks",
+                value=float(us_cost_twd),
+                min_value=0.0,
+                step=10_000.0,
+                format="%.0f",
+            )
+            if st.form_submit_button("💾 Update", type="primary",
+                                     use_container_width=True):
+                save_us_cost_twd(new_cost)
+                st.cache_data.clear()
+                st.success(f"Updated to {fmt(new_cost)}. Refreshing…")
+                st.rerun()
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # SECTION: P&L Change History
 # ═════════════════════════════════════════════════════════════════════════════
-def _section_pnl_history(tw_h, us_h):
+def _section_pnl_history(tw_h, us_h, us_cost_twd: float):
     st.markdown("<div class='section-title'>P&L Change History</div>",
                 unsafe_allow_html=True)
 
     tw_json  = json.dumps(tw_h)
     us_json  = json.dumps(us_h)
-    _us_cost = float(US_TWD_COST_BASIS)
+    _us_cost = float(us_cost_twd)
     # Always use current holdings × historical price (long-term buy-and-hold):
     # pass empty transactions so compute_portfolio_history uses the simple fallback path.
     _txn_json = "[]"
