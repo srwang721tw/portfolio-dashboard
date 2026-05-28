@@ -37,9 +37,10 @@ US_TICKERS = {
 PRICE_CACHE_TTL = 300       # 5 minutes (matches auto-refresh interval)
 HISTORY_CACHE_TTL = 3600    # 1 hour
 
-# Actual TWD amount invested in US stocks (bank transfer total).
-# Update this whenever you add more US funds.
-US_TWD_COST_BASIS = 2_188_129
+# Default US TWD cost basis — 0 means "not set".
+# The real value is stored in data/us_cost_config.json (synced from Google Drive)
+# and edited via the dashboard UI.  Never hardcode a real amount here.
+US_TWD_COST_BASIS = 0
 
 # Pledge thresholds
 PLEDGE_CRITICAL = 140.0     # Margin call

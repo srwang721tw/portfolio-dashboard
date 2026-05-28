@@ -128,5 +128,5 @@ def require_auth():
 
 
 def logout():
-    for key in ["authenticated", "username", "_gdrive_synced"]:
+    for key in ["authenticated", "username", "_gdrive_synced", "_users_synced"]:
         st.session_state.pop(key, None)
