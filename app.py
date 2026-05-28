@@ -81,6 +81,10 @@ _AX = dict(labelColor="#C9D1D9", titleColor="#8B949E", gridColor="#21262D",
 PALETTE = [COLOR_POSITIVE, COLOR_NEUTRAL, COLOR_PURPLE, COLOR_WARNING, COLOR_NEGATIVE,
            "#E8855A", "#A78BFA"]
 
+# TW stock sell-side cost factor: brokerage (0.1425% × 28% discount) + ETF transaction tax (0.1%)
+# Matches the notebook: factor = 1 - ((0.1425 * 0.28 + 0.1) / 100)
+TW_SELL_FACTOR = 1 - ((0.1425 * 0.28 + 0.1) / 100)   # ≈ 0.99860
+
 
 def _render(chart, height=None):
     if height:
@@ -614,10 +618,12 @@ def _section_holdings(tw_e, us_e, us_cost_twd: float):
 
     def _row(h, market_label):
         cp = h["current_price"]
-        mv = h["market_value_twd"] or 0
-        cb = h["cost_basis_twd"]   or 0
-        pnl = h["unrealized_pnl_twd"]
-        pct = h["pnl_pct"]
+        mv_raw = h["market_value_twd"] or 0
+        cb     = h["cost_basis_twd"]   or 0
+        # Apply sell-cost factor for TW stocks (brokerage + ETF transaction tax)
+        mv  = mv_raw * TW_SELL_FACTOR if h["currency"] == "TWD" else mv_raw
+        pnl = (mv - cb) if mv else None
+        pct = (pnl / cb * 100) if (pnl is not None and cb > 0) else None
         price_str = (f"{'$' if h['currency']=='USD' else 'NT$'}{cp:.2f}") if cp else "—"
         return {
             "Market":   market_label,
@@ -634,11 +640,14 @@ def _section_holdings(tw_e, us_e, us_cost_twd: float):
     rows = ([_row(h, "TW") for h in tw_e] +
             [_row(h, "US") for h in us_e])
 
-    # Subtotals
+    # Subtotals — TW market value also gets the sell-cost factor applied
     def _subtotal_row(label, holdings_list):
-        cb  = sum(h["cost_basis_twd"]          or 0 for h in holdings_list)
-        mv  = sum(h["market_value_twd"]         or 0 for h in holdings_list)
-        pnl = sum(h["unrealized_pnl_twd"]       or 0 for h in holdings_list)
+        cb = sum(h["cost_basis_twd"] or 0 for h in holdings_list)
+        mv = sum(
+            (h["market_value_twd"] or 0) * (TW_SELL_FACTOR if h["currency"] == "TWD" else 1.0)
+            for h in holdings_list
+        )
+        pnl = mv - cb
         pct = (pnl / cb * 100) if cb > 0 else 0
         return {
             "Market": "", "Ticker": f"**{label}**", "Shares": "",
