@@ -171,15 +171,29 @@ def _merge_csv_files(svc, name_contains: str, local_path: Path) -> bool:
         return False
 
 
+def sync_users():
+    """
+    Lightweight sync: download only users.json from Drive.
+    Called at app startup (before login) so accounts exist on a fresh
+    Railway deploy that has no local data files yet.
+    """
+    if not is_configured():
+        return
+    try:
+        from config.settings import USERS_FILE
+        download("users.json", USERS_FILE, force=True)
+    except Exception:
+        pass
+
+
 def sync_down_all():
     """
-    Pull all data files from Drive on session start.
+    Pull ALL data files from Drive.  Always force-overwrites so Drive is the
+    single source of truth — local copies are just a working cache.
 
     tw_stocks.csv / us_stocks.csv:
       Prefer exact-name match; fall back to searching for 對帳單 / 複委託庫存 files
       (the raw exports the user puts in the folder).
-    users.json / pledge / history:
-      Always force-overwrite users.json so accounts survive Railway redeploys.
     """
     if not is_configured():
         return
@@ -192,18 +206,18 @@ def sync_down_all():
         US_COST_CONFIG_FILE,
     )
 
-    # ── User / config files ────────────────────────────────────────────────
-    download("users.json",             USERS_FILE,           force=True)   # always sync accounts
-    download("pledge_config.json",     PLEDGE_FILE,          force=True)   # always sync pledges
-    download("us_cost_config.json",    US_COST_CONFIG_FILE,  force=True)   # always sync US cost
-    download("portfolio_history.json", HISTORY_FILE,         force=False)
+    # ── All config / history files — always overwrite from Drive ──────────
+    download("users.json",             USERS_FILE,           force=True)
+    download("pledge_config.json",     PLEDGE_FILE,          force=True)
+    download("us_cost_config.json",    US_COST_CONFIG_FILE,  force=True)
+    download("portfolio_history.json", HISTORY_FILE,         force=True)
 
     # ── TW stock CSV ───────────────────────────────────────────────────────
-    if not download("tw_stocks.csv", TW_CSV_FILE, force=False):
+    if not download("tw_stocks.csv", TW_CSV_FILE, force=True):
         # Fall back: merge all 對帳單 files in folder
         _merge_csv_files(svc, "對帳單", TW_CSV_FILE)
 
     # ── US stock CSV ───────────────────────────────────────────────────────
-    if not download("us_stocks.csv", US_CSV_FILE, force=False):
+    if not download("us_stocks.csv", US_CSV_FILE, force=True):
         # Fall back: use most recent 複委託庫存 file (no merge needed, latest is complete)
         _merge_csv_files(svc, "複委託庫存", US_CSV_FILE)

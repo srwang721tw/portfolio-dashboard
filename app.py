@@ -1073,6 +1073,17 @@ def _tab_upload():
 # ═════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ═════════════════════════════════════════════════════════════════════════════
+
+# Sync users.json from Drive before showing the login page so accounts
+# are available on a fresh Railway deploy (ephemeral filesystem).
+if not st.session_state.get("_users_synced"):
+    try:
+        from utils.gdrive import sync_users
+        sync_users()
+    except Exception:
+        pass
+    st.session_state._users_synced = True
+
 if not st.session_state.get("authenticated"):
     show_auth()
 else:
