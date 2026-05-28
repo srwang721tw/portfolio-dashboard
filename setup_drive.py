@@ -47,6 +47,7 @@ PLACEHOLDERS = {
     "users.json":             "{}",
     "pledge_config.json":     '{"loans": []}',
     "portfolio_history.json": "[]",
+    "us_cost_config.json":    '{"us_twd_cost": 0}',
 }
 
 
