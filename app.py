@@ -35,11 +35,11 @@ from utils.portfolio_calc import (
     enrich_holdings, portfolio_summary,
     compute_portfolio_history, compute_pledge_ratio,
 )
-from utils.history_manager import save_snapshot, get_pnl_change
+from utils.history_manager import save_snapshot
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Investment Dashboard", page_icon="📈",
+    page_title="Portfolio Dashboard", page_icon="📈",
     layout="wide", initial_sidebar_state="collapsed",
 )
 
@@ -88,7 +88,7 @@ def _render(chart, height=None):
     st.altair_chart(
         chart
         .configure(background="rgba(0,0,0,0)")
-        .configure_view(strokeOpacity=0)
+        .configure_view(strokeOpacity=0, clip=False)
         .configure_axis(**_AX)
         .configure_legend(labelColor="#C9D1D9", titleColor="#8B949E",
                           padding=8, cornerRadius=6, strokeColor="#30363D")
@@ -152,7 +152,7 @@ def show_auth():
     st.markdown(
         "<div style='text-align:center;font-size:2.5rem'>📈</div>"
         "<div style='text-align:center;font-size:1.4rem;font-weight:700;margin-bottom:20px'>"
-        "Investment Dashboard</div>",
+        "Portfolio Dashboard</div>",
         unsafe_allow_html=True,
     )
 
@@ -246,7 +246,7 @@ def _chart_pie(df: pd.DataFrame, value_col: str, label_col: str,
         order=alt.Order(f"{value_col}:Q", sort="descending"),
     )
 
-    pie = base.mark_arc(outerRadius=120, padAngle=0.02).encode(
+    pie = base.mark_arc(outerRadius=105, padAngle=0.02).encode(
         tooltip=[
             alt.Tooltip(f"{label_col}:N", title=""),
             alt.Tooltip(f"{value_col}:Q", format=",.0f", title="NT$"),
@@ -255,19 +255,19 @@ def _chart_pie(df: pd.DataFrame, value_col: str, label_col: str,
     )
 
     # Ticker name above mid-angle, percent below
-    text_ticker = base.mark_text(radius=148, dy=-7, fontSize=11,
+    text_ticker = base.mark_text(radius=132, dy=-7, fontSize=11,
                                   fontWeight="bold").encode(
         text=alt.Text("ticker_lbl:N"),
         color=alt.value("#E6EDF3"),
     )
-    text_pct = base.mark_text(radius=148, dy=7, fontSize=10).encode(
+    text_pct = base.mark_text(radius=132, dy=7, fontSize=10).encode(
         text=alt.Text("pct_lbl:N"),
         color=alt.value("#8B949E"),
     )
 
     return (
         alt.layer(pie, text_ticker, text_pct)
-        .properties(height=320, title=title)
+        .properties(height=360, title=title)
     )
 
 
@@ -470,16 +470,12 @@ def render_dashboard():
         save_snapshot(summary["total_value_twd"], summary["total_pnl_twd"],
                       summary["pnl_pct"])
 
-    pnl_1d  = get_pnl_change(1)
-    pnl_7d  = get_pnl_change(7)
-    pnl_30d = get_pnl_change(30)
-
     # ── Header ────────────────────────────────────────────────────────────────
     h1, h2, h3 = st.columns([5, 1.5, 1])
     with h1:
         _now8 = datetime.now(_TZ8).strftime('%Y/%m/%d %H:%M')
         st.markdown(
-            "<div style='font-size:1.4rem;font-weight:700'>📈 Investment Dashboard</div>"
+            "<div style='font-size:1.4rem;font-weight:700'>📈 Portfolio Dashboard</div>"
             f"<div style='font-size:0.78rem;color:#8B949E'>"
             f"Updated: {_now8} (UTC+8)"
             f"&nbsp;&nbsp;USD/TWD: {usd_twd:.2f} (Cathay)</div>",
@@ -495,20 +491,24 @@ def render_dashboard():
     st.markdown("<div class='divider'></div>", unsafe_allow_html=True)
 
     # ── KPIs ──────────────────────────────────────────────────────────────────
-    pnl = summary["total_pnl_twd"]
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Total Value",       fmt(summary["total_value_twd"]))
-    k2.metric("Unrealized P&L",    fmt(pnl),
+    pnl    = summary["total_pnl_twd"]
+    tw_cb  = sum(h["cost_basis_twd"]    or 0 for h in tw_e)
+    tw_mv  = sum(h["market_value_twd"]  or 0 for h in tw_e)
+    us_cb  = sum(h["cost_basis_twd"]    or 0 for h in us_e)
+    us_mv_usd = sum(h["market_value"]   or 0 for h in us_e)
+    us_pnl_twd = sum(h["unrealized_pnl_twd"] or 0 for h in us_e)
+
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric("Total Value",         fmt(summary["total_value_twd"]))
+    k2.metric("Unrealized P&L",      fmt(pnl),
               f"{summary['pnl_pct']:+.2f}%", delta_color=dc(pnl))
-    k3.metric("Today",
-              fmt(pnl_1d)  if pnl_1d  is not None else "—",
-              delta_color=dc(pnl_1d  or 0))
-    k4.metric("7-Day",
-              fmt(pnl_7d)  if pnl_7d  is not None else "—",
-              delta_color=dc(pnl_7d  or 0))
-    k5.metric("30-Day",
-              fmt(pnl_30d) if pnl_30d is not None else "—",
-              delta_color=dc(pnl_30d or 0))
+    k3.metric("TW Cost Basis",       fmt(tw_cb))
+    k4.metric("TW Market Value",     fmt(tw_mv),
+              fmtpnl(tw_mv - tw_cb), delta_color=dc(tw_mv - tw_cb))
+    k5.metric("US Cost Basis (TWD)", fmt(us_cb))
+    k6.metric("US Market Value (USD)",
+              fmt(us_mv_usd, prefix="$"),
+              fmtpnl(us_pnl_twd), delta_color=dc(us_pnl_twd))
 
     st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
 
@@ -655,21 +655,6 @@ def _section_holdings(tw_e, us_e, us_cost_twd: float):
 
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    # Highlight metrics
-    tw_cb = sum(h["cost_basis_twd"] or 0 for h in tw_e)
-    us_cb = sum(h["cost_basis_twd"] or 0 for h in us_e)
-    tw_mv = sum(h["market_value_twd"] or 0 for h in tw_e)
-    us_mv = sum(h["market_value_twd"] or 0 for h in us_e)
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("TW Cost Basis",  fmt(tw_cb))
-    m2.metric("TW Market Value", fmt(tw_mv),
-              fmtpnl(tw_mv - tw_cb), delta_color=dc(tw_mv - tw_cb))
-    m3.metric("US Cost Basis (TWD)",  fmt(us_cb))
-    m4.metric("US Market Value (USD)",
-              fmt(sum(h["market_value"] or 0 for h in us_e), prefix="$"),
-              fmtpnl(sum(h["unrealized_pnl_twd"] or 0 for h in us_e)),
-              delta_color=dc(sum(h["unrealized_pnl_twd"] or 0 for h in us_e)))
-
     # ── US Cost Basis editor ───────────────────────────────────────────────────
     with st.expander("⚙️ Update US Cost Basis (TWD)", expanded=False):
         st.caption(
@@ -722,7 +707,6 @@ def _section_pnl_history(tw_h, us_h, us_cost_twd: float):
         # Chart B — daily delta (day-over-day difference of the P&L level)
         daily = df60["total_pnl_twd"].dropna().diff().dropna().tail(30)
         _render(_chart_pnl_bars_daily(daily, "Daily P&L Change — day-over-day delta"))
-        _stats_row(daily)
 
     with h2:
         with st.spinner("Loading monthly data…"):
@@ -741,7 +725,6 @@ def _section_pnl_history(tw_h, us_h, us_cost_twd: float):
         })
         _render(_chart_pnl_categorical(df_m, "month",
                                         f"Monthly P&L Change — {this_year}"))
-        _stats_row(monthly)
 
     with h3:
         with st.spinner("Loading 3-year history (first load may take ~10 s)…"):
@@ -756,7 +739,6 @@ def _section_pnl_history(tw_h, us_h, us_cost_twd: float):
             "pnl":  annual.values,
         })
         _render(_chart_pnl_categorical(df_a, "year", "Annual P&L Change (3 years)"))
-        _stats_row(annual)
 
 
 def _stats_row(series: pd.Series):
@@ -962,10 +944,6 @@ def _section_pledge(prices, usd_twd):
                       "—" if any_price_missing else fmt(0))
             if any_price_missing:
                 st.caption("⚠️ Some prices unavailable — ratio cannot be calculated")
-
-        # ── Gauge chart ────────────────────────────────────────────────────────
-        if overall_ratio is not None:
-            _render(_chart_pledge_gauge(overall_ratio), height=100)
 
         # ── Per-stock monitoring table ─────────────────────────────────────────
         # Columns: 日期 | 到期日 | 股票代號 | 股數 | 利率 | 借款金額 | 目前利息 | 維持率
