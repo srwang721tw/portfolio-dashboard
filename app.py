@@ -681,9 +681,23 @@ def _section_holdings(tw_e, us_e, us_cost_twd: float):
             )
             if st.form_submit_button("💾 Update", type="primary",
                                      use_container_width=True):
-                save_us_cost_twd(new_cost)
+                drive_ok = save_us_cost_twd(new_cost)
                 st.cache_data.clear()
-                st.success(f"Updated to {fmt(new_cost)}. Refreshing…")
+                if drive_ok:
+                    st.success(f"Updated to {fmt(new_cost)} — synced to Drive ✅")
+                else:
+                    try:
+                        from utils.gdrive import is_configured
+                        if is_configured():
+                            st.warning(
+                                f"Updated to {fmt(new_cost)} locally — "
+                                "Drive sync failed. Make sure `us_cost_config.json` "
+                                "exists in your Drive folder."
+                            )
+                        else:
+                            st.success(f"Updated to {fmt(new_cost)} (Drive not configured)")
+                    except Exception:
+                        st.success(f"Updated to {fmt(new_cost)}")
                 st.rerun()
 
 
@@ -1042,6 +1056,24 @@ def _section_pledge(prices, usd_twd):
 # ═════════════════════════════════════════════════════════════════════════════
 # TAB: Upload (CSV files only)
 # ═════════════════════════════════════════════════════════════════════════════
+def _csv_upload_feedback(local_path, label: str):
+    """Upload a CSV to Drive and return an (is_warning, message) tuple."""
+    try:
+        from utils.gdrive import upload, is_configured
+        if not is_configured():
+            return False, f"{label} saved (Google Drive not configured)"
+        ok = upload(local_path)
+        if ok:
+            return False, f"{label} uploaded and synced to Drive ✅"
+        return True, (
+            f"{label} saved locally — Drive sync failed. "
+            f"Make sure `{local_path.name}` exists in your Drive folder "
+            f"(upload a placeholder once, then re-save here)."
+        )
+    except Exception:
+        return False, f"{label} saved"
+
+
 def _tab_upload():
     st.markdown("<div class='section-title'>Upload Holdings CSV</div>",
                 unsafe_allow_html=True)
@@ -1052,22 +1084,20 @@ def _tab_upload():
         up_tw = st.file_uploader("TW CSV", type=["csv"], key="up_tw")
         if up_tw:
             TW_CSV_FILE.write_bytes(up_tw.getvalue())
-            try:
-                from utils.gdrive import upload; upload(TW_CSV_FILE)
-            except Exception:
-                pass
-            st.success("TW CSV uploaded"); st.cache_data.clear(); st.rerun()
+            warn, msg = _csv_upload_feedback(TW_CSV_FILE, "TW CSV")
+            st.cache_data.clear()
+            st.warning(msg) if warn else st.success(msg)
+            st.rerun()
 
     with uc2:
         st.caption("**US Stocks** — 複委託庫存 (holdings snapshot) or summary CSV")
         up_us = st.file_uploader("US CSV", type=["csv"], key="up_us")
         if up_us:
             US_CSV_FILE.write_bytes(up_us.getvalue())
-            try:
-                from utils.gdrive import upload; upload(US_CSV_FILE)
-            except Exception:
-                pass
-            st.success("US CSV uploaded"); st.cache_data.clear(); st.rerun()
+            warn, msg = _csv_upload_feedback(US_CSV_FILE, "US CSV")
+            st.cache_data.clear()
+            st.warning(msg) if warn else st.success(msg)
+            st.rerun()
 
 
 # ═════════════════════════════════════════════════════════════════════════════

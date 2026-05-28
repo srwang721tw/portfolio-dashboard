@@ -42,12 +42,16 @@ creds = service_account.Credentials.from_service_account_info(
 )
 svc = build("drive", "v3", credentials=creds, cache_discovery=False)
 
-# Placeholder content for each file
+# Placeholder content for each file.
+# CSVs only need a header row so the service account can later overwrite them
+# via the Upload tab.  Real data is uploaded through the dashboard.
 PLACEHOLDERS = {
     "users.json":             "{}",
     "pledge_config.json":     '{"loans": []}',
     "portfolio_history.json": "[]",
     "us_cost_config.json":    '{"us_twd_cost": 0}',
+    "tw_stocks.csv":          "symbol,shares,cost_per_share,currency\n",
+    "us_stocks.csv":          "symbol,shares,cost_per_share,currency\n",
 }
 
 

@@ -56,9 +56,13 @@ def _folder() -> str:
 
 def upload(local_path: Path) -> bool:
     """
-    Upload a local file to the configured Drive folder.
-    Creates the file if it doesn't exist; updates it if it does.
-    Storage counts against the service account's own quota (15 GB default).
+    Update an existing file in the configured Drive folder with local content.
+    Returns True on success, False if the file doesn't exist on Drive or on error.
+
+    IMPORTANT: Service accounts on personal Google Drive have no storage quota and
+    cannot CREATE new files (raises HTTP 403).  The target file must already exist
+    in the Drive folder before this function can update it.
+    Seed missing files once with setup_drive.py or by uploading them manually.
     """
     svc = _service()
     if not svc or not local_path.exists():
@@ -73,16 +77,10 @@ def upload(local_path: Path) -> bool:
             .execute()
             .get("files", [])
         )
+        if not existing:
+            return False   # file not seeded on Drive yet — cannot create via service account
         media = MediaFileUpload(str(local_path), resumable=False)
-        if existing:
-            svc.files().update(fileId=existing[0]["id"], media_body=media).execute()
-        else:
-            # First upload — create the file in the Drive folder
-            svc.files().create(
-                body={"name": name, "parents": [fid]},
-                media_body=media,
-                fields="id",
-            ).execute()
+        svc.files().update(fileId=existing[0]["id"], media_body=media).execute()
         return True
     except Exception:
         return False

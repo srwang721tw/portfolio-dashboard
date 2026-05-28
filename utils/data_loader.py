@@ -328,16 +328,19 @@ def load_us_cost_twd() -> float:
     return float(US_TWD_COST_BASIS)
 
 
-def save_us_cost_twd(amount: float):
-    """Persist the US TWD cost basis to the config file and sync to Drive."""
+def save_us_cost_twd(amount: float) -> bool:
+    """Persist the US TWD cost basis to the config file and sync to Drive.
+    Returns True if Drive sync succeeded."""
     US_COST_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(US_COST_CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump({"us_twd_cost": float(amount)}, f)
     try:
-        from utils.gdrive import upload
-        upload(US_COST_CONFIG_FILE)
+        from utils.gdrive import upload, is_configured
+        if is_configured():
+            return bool(upload(US_COST_CONFIG_FILE))
     except Exception:
         pass
+    return False
 
 
 def load_tw_transactions() -> List[Dict]:
