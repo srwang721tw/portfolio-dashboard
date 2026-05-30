@@ -1,12 +1,10 @@
-import json
 from datetime import datetime
-from pathlib import Path
 from typing import Dict, List, Optional
 
 import pandas as pd
 import pytz
 
-from config.settings import HISTORY_FILE
+import utils.db as db
 
 TZ = pytz.timezone("Asia/Taipei")
 
@@ -15,48 +13,19 @@ def _today_str() -> str:
     return datetime.now(TZ).strftime("%Y-%m-%d")
 
 
-def load_history() -> List[Dict]:
-    if not HISTORY_FILE.exists():
-        return []
-    with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+def load_history(username: str) -> List[Dict]:
+    return db.get_history(username)
 
 
-def save_snapshot(total_value_twd: float, total_pnl_twd: float, pnl_pct: float):
-    """Save or update today's portfolio snapshot."""
-    history = load_history()
-    today = _today_str()
-
-    # Update existing entry for today or append new one
-    existing = next((h for h in history if h["date"] == today), None)
-    if existing:
-        existing.update({
-            "total_value_twd": total_value_twd,
-            "total_pnl_twd": total_pnl_twd,
-            "pnl_pct": pnl_pct,
-        })
-    else:
-        history.append({
-            "date": today,
-            "total_value_twd": total_value_twd,
-            "total_pnl_twd": total_pnl_twd,
-            "pnl_pct": pnl_pct,
-        })
-
-    # Keep last 730 days
-    history = sorted(history, key=lambda x: x["date"])[-730:]
-    HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(history, f, indent=2)
-    try:
-        from utils.gdrive import upload
-        upload(HISTORY_FILE)
-    except Exception:
-        pass
+def save_snapshot(username: str, total_value_twd: float,
+                  total_pnl_twd: float, pnl_pct: float):
+    """Save or update today's portfolio snapshot for this user."""
+    db.upsert_history_snapshot(username, _today_str(),
+                               total_value_twd, total_pnl_twd, pnl_pct)
 
 
-def history_to_dataframe() -> pd.DataFrame:
-    history = load_history()
+def history_to_dataframe(username: str) -> pd.DataFrame:
+    history = load_history(username)
     if not history:
         return pd.DataFrame()
     df = pd.DataFrame(history)
@@ -66,9 +35,9 @@ def history_to_dataframe() -> pd.DataFrame:
     return df
 
 
-def get_pnl_change(days: int = 1) -> Optional[float]:
+def get_pnl_change(username: str, days: int = 1) -> Optional[float]:
     """Return P&L change over last N days from stored history."""
-    df = history_to_dataframe()
+    df = history_to_dataframe(username)
     if df.empty or len(df) < 2:
         return None
     recent = df["total_pnl_twd"].dropna()

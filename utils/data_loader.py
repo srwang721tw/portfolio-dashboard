@@ -5,18 +5,19 @@ Handles two input formats automatically:
   1. 對帳單 (transaction history): 股名, 日期, 成交股數, 淨收付, ...
   2. 複委託庫存 (US holdings snapshot): 代號, 目前庫存, 均價, 庫存成本, ...
   3. Simple summary: symbol/代號, shares, cost/均價, ...  (fallback)
+
+Public API now requires a `username` argument; all persistence goes through
+utils.db (Neon PostgreSQL) instead of local CSV files.
 """
 
-import json
+import io
 from pathlib import Path
 from typing import List, Dict, Optional
 
 import pandas as pd
 
-from config.settings import (
-    TW_CSV_FILE, US_CSV_FILE, SAMPLE_TW_CSV, SAMPLE_US_CSV,
-    PLEDGE_FILE, US_COST_CONFIG_FILE, US_TWD_COST_BASIS,
-)
+from config.settings import SAMPLE_TW_CSV, SAMPLE_US_CSV, US_TWD_COST_BASIS
+import utils.db as db
 
 # ── Taiwan stock name → ticker code ──────────────────────────────────────────
 TW_NAME_TO_TICKER: Dict[str, str] = {
@@ -58,12 +59,23 @@ _US_COL_ALIASES = {
 }
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Low-level helpers ─────────────────────────────────────────────────────────
 
 def _read_csv(path: Path) -> Optional[pd.DataFrame]:
     for enc in ["utf-8", "utf-8-sig", "big5", "cp950"]:
         try:
             return pd.read_csv(path, encoding=enc)
+        except (UnicodeDecodeError, Exception):
+            continue
+    return None
+
+
+def _read_csv_bytes(buf: io.BytesIO) -> Optional[pd.DataFrame]:
+    """BytesIO variant of _read_csv — used when parsing uploaded file bytes in memory."""
+    for enc in ["utf-8", "utf-8-sig", "big5", "cp950"]:
+        try:
+            buf.seek(0)
+            return pd.read_csv(buf, encoding=enc)
         except (UnicodeDecodeError, Exception):
             continue
     return None
@@ -100,12 +112,22 @@ def _is_fuzhuotuo(df: pd.DataFrame) -> bool:
 def _parse_dazhangdan(df: pd.DataFrame) -> Optional[List[Dict]]:
     """
     Process 對帳單 transaction history into net current holdings.
+    Returns aggregated holdings list or None on failure.
+    """
+    try:
+        rows = _parse_dazhangdan_rows(df)
+        if not rows:
+            return None
+        return _aggregate_tw_transactions(rows) or None
+    except Exception:
+        return None
 
-    Logic mirrors TWD.ipynb:
-      - Map stock names to ticker codes via TW_NAME_TO_TICKER
-      - Apply per-ticker cutoff dates from TW_INCLUDE_FROM
-      - Net shares: buys (淨收付 < 0) add shares; sells subtract shares
-      - Cost basis: sum of abs(淨收付) for buys minus proceeds from sells
+
+def _parse_dazhangdan_rows(df: pd.DataFrame) -> List[Dict]:
+    """
+    Parse 對帳單 DataFrame into raw per-transaction rows for DB storage.
+    Returns [{symbol, name, trade_date (str YYYY-MM-DD), share_delta, cost_flow}].
+    These rows preserve full transaction history; net holdings are re-derived at read time.
     """
     try:
         df = df.copy()
@@ -114,7 +136,7 @@ def _parse_dazhangdan(df: pd.DataFrame) -> Optional[List[Dict]]:
         df['代號'] = df['股名'].map(TW_NAME_TO_TICKER)
         df = df.dropna(subset=['代號'])
 
-        df['日期'] = pd.to_datetime(df['日期'], errors='coerce')
+        df['日期']   = pd.to_datetime(df['日期'], errors='coerce')
         df['成交股數'] = _clean_num(df['成交股數'])
         df['淨收付']   = _clean_num(df['淨收付'])
         df = df.dropna(subset=['日期', '成交股數', '淨收付'])
@@ -130,11 +152,9 @@ def _parse_dazhangdan(df: pd.DataFrame) -> Optional[List[Dict]]:
                 frames.append(chunk)
 
         if not frames:
-            return None
+            return []
 
         filtered = pd.concat(frames, ignore_index=True)
-
-        # Buy = 淨收付 < 0 (cash outflow); Sell = 淨收付 > 0
         filtered['is_buy']      = filtered['淨收付'] < 0
         filtered['share_delta'] = filtered.apply(
             lambda r: r['成交股數'] if r['is_buy'] else -r['成交股數'], axis=1
@@ -143,24 +163,51 @@ def _parse_dazhangdan(df: pd.DataFrame) -> Optional[List[Dict]]:
         filtered.loc[~filtered['is_buy'], 'cost_flow'] *= -1  # sells reduce cost basis
 
         name_rev = {v: k for k, v in TW_NAME_TO_TICKER.items()}
-        holdings = []
-        for ticker, grp in filtered.groupby('代號'):
-            net_shares = grp['share_delta'].sum()
-            net_cost   = grp['cost_flow'].sum()
-            if net_shares <= 0 or net_cost <= 0:
-                continue
-            holdings.append({
-                'symbol':         ticker,
-                'name':           name_rev.get(ticker, ticker),
-                'shares':         int(net_shares),
-                'cost_per_share': round(net_cost / net_shares, 4),
-                'currency':       'TWD',
+        rows = []
+        for _, row in filtered.iterrows():
+            rows.append({
+                'symbol':      row['代號'],
+                'name':        name_rev.get(row['代號'], row['代號']),
+                'trade_date':  row['日期'].strftime('%Y-%m-%d'),
+                'share_delta': float(row['share_delta']),
+                'cost_flow':   float(row['cost_flow']),
             })
-
-        return holdings or None
+        return rows
 
     except Exception:
-        return None
+        return []
+
+
+def _aggregate_tw_transactions(rows: List[Dict]) -> List[Dict]:
+    """
+    Aggregate raw transaction rows into net holdings.
+    Input: [{symbol, name, trade_date, share_delta, cost_flow}]
+    Output: [{symbol, name, shares, cost_per_share, currency}]
+    """
+    groups: Dict[str, Dict] = {}
+    name_map: Dict[str, str] = {}
+    for r in rows:
+        sym = r['symbol']
+        if sym not in groups:
+            groups[sym] = {'share_delta': 0.0, 'cost_flow': 0.0}
+        groups[sym]['share_delta'] += r['share_delta']
+        groups[sym]['cost_flow']   += r['cost_flow']
+        name_map[sym] = r.get('name', sym)
+
+    holdings = []
+    for sym, agg in groups.items():
+        net_shares = agg['share_delta']
+        net_cost   = agg['cost_flow']
+        if net_shares <= 0 or net_cost <= 0:
+            continue
+        holdings.append({
+            'symbol':         sym,
+            'name':           name_map.get(sym, sym),
+            'shares':         int(net_shares),
+            'cost_per_share': round(net_cost / net_shares, 4),
+            'currency':       'TWD',
+        })
+    return holdings
 
 
 def _parse_fuzhuotuo(df: pd.DataFrame) -> Optional[List[Dict]]:
@@ -222,181 +269,48 @@ def _parse_summary_csv(path: Path, col_aliases: Dict) -> Optional[pd.DataFrame]:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def load_tw_holdings() -> List[Dict]:
-    path = TW_CSV_FILE if TW_CSV_FILE.exists() else SAMPLE_TW_CSV
-
-    df_raw = _read_csv(path)
-    if df_raw is not None:
-        # Try 對帳單 format
-        if _is_dazhangdan(df_raw):
-            result = _parse_dazhangdan(df_raw)
-            if result:
-                return result
-
-        # Fallback: try generic summary
-        df = _parse_summary_csv(path, _TW_COL_ALIASES)
-        if df is not None:
-            holdings = []
-            for _, row in df.iterrows():
-                sym = str(row['symbol'])
-                sym = sym.zfill(4) if sym.isdigit() else sym
-                shares = int(row.get('shares', 0) or 0)
-                cost   = float(row.get('cost', 0) or 0)
-                total  = float(row.get('total_cost', 0) or 0)
-                if cost == 0 and total > 0 and shares > 0:
-                    cost = total / shares
-                holdings.append({
-                    'symbol': sym,
-                    'name':   str(row.get('name', sym)),
-                    'shares': shares,
-                    'cost_per_share': cost,
-                    'currency': 'TWD',
-                })
-            if holdings:
-                return holdings
-
+def load_tw_holdings(username: str) -> List[Dict]:
+    """Load TW holdings for this user from DB (derived from transaction history)."""
+    rows = db.get_tw_transactions(username)
+    if rows:
+        holdings = _aggregate_tw_transactions(rows)
+        if holdings:
+            return holdings
     return _sample_tw_holdings()
 
 
-def load_us_holdings() -> List[Dict]:
-    path = US_CSV_FILE if US_CSV_FILE.exists() else SAMPLE_US_CSV
-
-    df_raw = _read_csv(path)
-    if df_raw is not None:
-        # Try 複委託庫存 format
-        if _is_fuzhuotuo(df_raw):
-            result = _parse_fuzhuotuo(df_raw)
-            if result:
-                return result
-
-        # Fallback: try generic summary
-        df = _parse_summary_csv(path, _US_COL_ALIASES)
-        if df is not None:
-            holdings = []
-            for _, row in df.iterrows():
-                sym    = str(row['symbol']).upper().strip()
-                shares = float(row.get('shares', 0) or 0)
-                cost   = float(row.get('cost', 0) or 0)
-                total  = float(row.get('total_cost', 0) or 0)
-                if cost == 0 and total > 0 and shares > 0:
-                    cost = total / shares
-                holdings.append({
-                    'symbol': sym,
-                    'name':   str(row.get('name', sym)),
-                    'shares': shares,
-                    'cost_per_share': cost,
-                    'currency': 'USD',
-                })
-            if holdings:
-                return holdings
-
-    return _sample_us_holdings()
+def load_us_holdings(username: str) -> List[Dict]:
+    """Load US holdings snapshot for this user from DB."""
+    rows = db.get_us_holdings(username)
+    return rows if rows else _sample_us_holdings()
 
 
-def load_pledge_config() -> Dict:
-    if PLEDGE_FILE.exists():
-        with open(PLEDGE_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {'loans': []}
+def load_pledge_config(username: str) -> Dict:
+    """Load pledge loan configuration for this user from DB."""
+    return db.get_pledge_config(username)
 
 
-def save_pledge_config(config: Dict) -> bool:
-    """Save pledge config locally and upload to Drive. Returns True if Drive sync OK."""
-    PLEDGE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(PLEDGE_FILE, 'w', encoding='utf-8') as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
-    try:
-        from utils.gdrive import upload, is_configured
-        if is_configured():
-            return bool(upload(PLEDGE_FILE))
-    except Exception:
-        pass
-    return False
+def save_pledge_config(username: str, config: Dict) -> None:
+    """Persist pledge config for this user to DB."""
+    db.save_pledge_config(username, config)
 
 
-def load_us_cost_twd() -> float:
-    """Load the actual TWD invested in US stocks. Falls back to the settings constant."""
-    if US_COST_CONFIG_FILE.exists():
-        try:
-            with open(US_COST_CONFIG_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            val = float(data.get("us_twd_cost", 0))
-            if val > 0:
-                return val
-        except Exception:
-            pass
-    return float(US_TWD_COST_BASIS)
+def load_us_cost_twd(username: str) -> float:
+    """Load the actual TWD invested in US stocks for this user."""
+    return db.get_user_config_num(username, 'us_twd_cost', default=float(US_TWD_COST_BASIS))
 
 
-def save_us_cost_twd(amount: float) -> bool:
-    """Persist the US TWD cost basis to the config file and sync to Drive.
-    Returns True if Drive sync succeeded."""
-    US_COST_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(US_COST_CONFIG_FILE, 'w', encoding='utf-8') as f:
-        json.dump({"us_twd_cost": float(amount)}, f)
-    try:
-        from utils.gdrive import upload, is_configured
-        if is_configured():
-            return bool(upload(US_COST_CONFIG_FILE))
-    except Exception:
-        pass
-    return False
+def save_us_cost_twd(username: str, amount: float) -> None:
+    """Persist the US TWD cost basis for this user to DB."""
+    db.set_user_config_num(username, 'us_twd_cost', amount)
 
 
-def load_tw_transactions() -> List[Dict]:
+def load_tw_transactions(username: str) -> List[Dict]:
     """
     Load TW transaction history for running-position P&L calculations.
-    Returns list of {symbol, date (str YYYY-MM-DD), share_delta, cost_flow}.
-    Only available when the CSV is in 對帳單 format.
+    Returns [{symbol, name, trade_date, share_delta, cost_flow}].
     """
-    path = TW_CSV_FILE if TW_CSV_FILE.exists() else SAMPLE_TW_CSV
-    df_raw = _read_csv(path)
-    if df_raw is None or not _is_dazhangdan(df_raw):
-        return []
-    try:
-        df = df_raw.copy()
-        df.columns = df.columns.str.strip()
-        df['股名'] = df['股名'].str.strip()
-        df['代號'] = df['股名'].map(TW_NAME_TO_TICKER)
-        df = df.dropna(subset=['代號'])
-
-        df['日期'] = pd.to_datetime(df['日期'], errors='coerce')
-        df['成交股數'] = _clean_num(df['成交股數'])
-        df['淨收付']   = _clean_num(df['淨收付'])
-        df = df.dropna(subset=['日期', '成交股數', '淨收付'])
-
-        # Apply per-ticker date filters (same cutoffs as _parse_dazhangdan)
-        frames = []
-        for ticker, since in TW_INCLUDE_FROM.items():
-            mask = df['代號'] == ticker
-            if since:
-                mask &= df['日期'] >= pd.Timestamp(since)
-            chunk = df[mask]
-            if not chunk.empty:
-                frames.append(chunk)
-
-        if not frames:
-            return []
-
-        filtered = pd.concat(frames, ignore_index=True)
-        filtered['is_buy']      = filtered['淨收付'] < 0
-        filtered['share_delta'] = filtered.apply(
-            lambda r: r['成交股數'] if r['is_buy'] else -r['成交股數'], axis=1
-        )
-        filtered['cost_flow'] = filtered['淨收付'].abs()
-        filtered.loc[~filtered['is_buy'], 'cost_flow'] *= -1
-
-        txns = []
-        for _, row in filtered.iterrows():
-            txns.append({
-                'symbol':      row['代號'],
-                'date':        row['日期'].strftime('%Y-%m-%d'),
-                'share_delta': float(row['share_delta']),
-                'cost_flow':   float(row['cost_flow']),
-            })
-        return txns
-    except Exception:
-        return []
+    return db.get_tw_transactions(username)
 
 
 def _sample_tw_holdings() -> List[Dict]:

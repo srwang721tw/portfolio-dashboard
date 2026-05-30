@@ -10,12 +10,13 @@ from datetime import datetime, date, timezone, timedelta
 
 _TZ8 = timezone(timedelta(hours=8))   # UTC+8 (Asia/Taipei)
 
+import io
+
 from config.settings import (
     APP_NAME, APP_ICON,
     COLOR_POSITIVE, COLOR_NEGATIVE, COLOR_NEUTRAL, COLOR_WARNING, COLOR_PURPLE,
     PLEDGE_CRITICAL, PLEDGE_WARNING, PLEDGE_SAFE,
-    TW_TICKERS, US_TICKERS, TW_CSV_FILE, US_CSV_FILE,
-    PLEDGE_FILE,
+    TW_TICKERS, US_TICKERS,
 )
 from utils.auth import (
     has_users, create_user, verify_password, verify_totp,
@@ -26,7 +27,10 @@ from utils.data_loader import (
     load_tw_holdings, load_us_holdings,
     load_pledge_config, save_pledge_config,
     load_us_cost_twd, save_us_cost_twd,
+    _read_csv_bytes, _is_dazhangdan, _is_fuzhuotuo,
+    _parse_dazhangdan_rows, _parse_fuzhuotuo,
 )
+import utils.db as db
 from utils.price_fetcher import (
     fetch_current_prices, fetch_usd_twd_rate,
     fetch_historical_prices, fetch_usd_twd_history,
@@ -426,22 +430,14 @@ def _chart_pledge_gauge(ratio: float):
 # DASHBOARD
 # ═════════════════════════════════════════════════════════════════════════════
 def render_dashboard():
-    # ── One-time Drive sync ───────────────────────────────────────────────────
-    if not st.session_state.get("_gdrive_synced"):
-        with st.spinner("Syncing data..."):
-            try:
-                from utils.gdrive import sync_down_all
-                sync_down_all()
-            except Exception:
-                pass
-        st.session_state._gdrive_synced = True
+    username = st.session_state.username
 
-    # ── Load US cost basis (editable, persisted in config file) ──────────────
-    _us_cost_twd = load_us_cost_twd()
+    # ── Load US cost basis (editable, persisted in DB) ────────────────────────
+    _us_cost_twd = load_us_cost_twd(username)
 
     # ── Load holdings ─────────────────────────────────────────────────────────
-    tw_h = load_tw_holdings()
-    us_h = load_us_holdings()
+    tw_h = load_tw_holdings(username)
+    us_h = load_us_holdings(username)
     all_syms = tuple(h["symbol"] for h in tw_h + us_h)
 
     # ── Fetch prices ──────────────────────────────────────────────────────────
@@ -484,7 +480,7 @@ def render_dashboard():
     us_pnl_twd = us_mv_twd - us_cb
 
     if total_val > 0:
-        save_snapshot(total_val, pnl, pnl_pct)
+        save_snapshot(username, total_val, pnl, pnl_pct)
 
     # ── Header ────────────────────────────────────────────────────────────────
     h1, h2, h3 = st.columns([5, 1.5, 1])
@@ -694,23 +690,10 @@ def _section_holdings(tw_e, us_e, us_cost_twd: float):
             )
             if st.form_submit_button("💾 Update", type="primary",
                                      use_container_width=True):
-                drive_ok = save_us_cost_twd(new_cost)
+                _uname = st.session_state.username
+                save_us_cost_twd(_uname, new_cost)
                 st.cache_data.clear()
-                if drive_ok:
-                    st.success(f"Updated to {fmt(new_cost)} — synced to Drive ✅")
-                else:
-                    try:
-                        from utils.gdrive import is_configured
-                        if is_configured():
-                            st.warning(
-                                f"Updated to {fmt(new_cost)} locally — "
-                                "Drive sync failed. Make sure `us_cost_config.json` "
-                                "exists in your Drive folder."
-                            )
-                        else:
-                            st.success(f"Updated to {fmt(new_cost)} (Drive not configured)")
-                    except Exception:
-                        st.success(f"Updated to {fmt(new_cost)}")
+                st.success(f"Updated to {fmt(new_cost)} ✅")
                 st.rerun()
 
 
@@ -910,7 +893,8 @@ def _df_to_loans(df: pd.DataFrame):
 #   2. Edit loan configuration in a collapsible expander below
 # ═════════════════════════════════════════════════════════════════════════════
 def _section_pledge(prices, usd_twd):
-    loans = load_pledge_config().get("loans", [])
+    _uname = st.session_state.username
+    loans = load_pledge_config(_uname).get("loans", [])
 
     st.markdown("<div class='section-title'>Pledge Monitoring</div>",
                 unsafe_allow_html=True)
@@ -1047,85 +1031,62 @@ def _section_pledge(prices, usd_twd):
         )
 
         if st.button("💾 Save", type="primary", use_container_width=True):
-            new_loans  = _df_to_loans(edited_df)
-            drive_ok   = save_pledge_config({"loans": new_loans})
-            if drive_ok:
-                st.success("✅ Saved and synced to Google Drive")
-            else:
-                try:
-                    from utils.gdrive import is_configured
-                    if is_configured():
-                        st.warning(
-                            "✅ Saved locally — Google Drive upload failed. "
-                            "Make sure the file exists in Drive (run setup_drive.py once)."
-                        )
-                    else:
-                        st.success("✅ Saved locally (Google Drive not configured)")
-                except Exception:
-                    st.success("✅ Saved")
+            new_loans = _df_to_loans(edited_df)
+            save_pledge_config(_uname, {"loans": new_loans})
+            st.success("✅ Saved")
             st.rerun()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # TAB: Upload (CSV files only)
 # ═════════════════════════════════════════════════════════════════════════════
-def _csv_upload_feedback(local_path, label: str):
-    """Upload a CSV to Drive and return an (is_warning, message) tuple."""
-    try:
-        from utils.gdrive import upload, is_configured
-        if not is_configured():
-            return False, f"{label} saved (Google Drive not configured)"
-        ok = upload(local_path)
-        if ok:
-            return False, f"{label} uploaded and synced to Drive ✅"
-        return True, (
-            f"{label} saved locally — Drive sync failed. "
-            f"Make sure `{local_path.name}` exists in your Drive folder "
-            f"(upload a placeholder once, then re-save here)."
-        )
-    except Exception:
-        return False, f"{label} saved"
-
-
 def _tab_upload():
     st.markdown("<div class='section-title'>Upload Holdings CSV</div>",
                 unsafe_allow_html=True)
+    username = st.session_state.username
     uc1, uc2 = st.columns(2)
 
     with uc1:
-        st.caption("**TW Stocks** — 國泰證券 對帳單 (transaction history) or summary CSV")
+        st.caption("**TW Stocks** — 國泰證券 對帳單 (transaction history)")
         up_tw = st.file_uploader("TW CSV", type=["csv"], key="up_tw")
         if up_tw:
-            TW_CSV_FILE.write_bytes(up_tw.getvalue())
-            warn, msg = _csv_upload_feedback(TW_CSV_FILE, "TW CSV")
-            st.cache_data.clear()
-            st.warning(msg) if warn else st.success(msg)
-            st.rerun()
+            df = _read_csv_bytes(io.BytesIO(up_tw.getvalue()))
+            if df is not None and _is_dazhangdan(df):
+                rows = _parse_dazhangdan_rows(df)
+                if rows:
+                    db.replace_tw_transactions(username, rows)
+                    st.cache_data.clear()
+                    st.success(f"✅ 已匯入 {len(rows)} 筆交易紀錄")
+                    st.rerun()
+                else:
+                    st.warning("CSV 解析成功但無有效交易資料（請確認欄位名稱與日期設定）。")
+            else:
+                st.error("無法識別 CSV 格式。請上傳國泰證券「對帳單」格式（需含欄位：股名、日期、成交股數、淨收付）。")
 
     with uc2:
-        st.caption("**US Stocks** — 複委託庫存 (holdings snapshot) or summary CSV")
+        st.caption("**US Stocks** — 複委託庫存 (holdings snapshot)")
         up_us = st.file_uploader("US CSV", type=["csv"], key="up_us")
         if up_us:
-            US_CSV_FILE.write_bytes(up_us.getvalue())
-            warn, msg = _csv_upload_feedback(US_CSV_FILE, "US CSV")
-            st.cache_data.clear()
-            st.warning(msg) if warn else st.success(msg)
-            st.rerun()
+            df = _read_csv_bytes(io.BytesIO(up_us.getvalue()))
+            if df is not None and _is_fuzhuotuo(df):
+                holdings = _parse_fuzhuotuo(df) or []
+                if holdings:
+                    db.replace_us_holdings(username, holdings)
+                    st.cache_data.clear()
+                    st.success(f"✅ 已匯入 {len(holdings)} 筆美股庫存")
+                    st.rerun()
+                else:
+                    st.warning("CSV 解析成功但無有效庫存資料（請確認庫存數量 > 0）。")
+            else:
+                st.error("無法識別 CSV 格式。請上傳「複委託庫存」格式（需含欄位：代號、目前庫存、均價）。")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Sync users.json from Drive before showing the login page so accounts
-# are available on a fresh Railway deploy (ephemeral filesystem).
-if not st.session_state.get("_users_synced"):
-    try:
-        from utils.gdrive import sync_users
-        sync_users()
-    except Exception:
-        pass
-    st.session_state._users_synced = True
+# Ensure DB schema exists on startup (idempotent; fast after first call).
+db.ensure_schema()
 
 if not st.session_state.get("authenticated"):
     show_auth()

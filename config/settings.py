@@ -12,12 +12,6 @@ APP_NAME = "投資組合儀表板"
 APP_ICON = "📈"
 APP_SECRET_KEY = os.getenv("APP_SECRET_KEY", "dev_secret_change_in_production")
 
-USERS_FILE = DATA_DIR / "users.json"
-PLEDGE_FILE = DATA_DIR / "pledge_config.json"
-HISTORY_FILE = DATA_DIR / "portfolio_history.json"
-US_COST_CONFIG_FILE = DATA_DIR / "us_cost_config.json"
-TW_CSV_FILE = DATA_DIR / "tw_stocks.csv"
-US_CSV_FILE = DATA_DIR / "us_stocks.csv"
 SAMPLE_TW_CSV = BASE_DIR / "data" / "sample_tw_stocks.csv"
 SAMPLE_US_CSV = BASE_DIR / "data" / "sample_us_stocks.csv"
 
