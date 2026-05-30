@@ -500,3 +500,53 @@ def get_history(username: str) -> List[Dict]:
             """, (username,))
             return [dict(r) for r in cur.fetchall()]
     return _with_conn(_run)
+
+
+# ── Utility ────────────────────────────────────────────────────────────────────
+
+def has_user_data(username: str) -> bool:
+    """Return True if the user has uploaded any TW transactions or US holdings."""
+    def _run(conn):
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT (
+                    (SELECT COUNT(*) FROM tw_transactions WHERE username = %s) +
+                    (SELECT COUNT(*) FROM us_holdings     WHERE username = %s)
+                ) > 0
+            """, (username, username))
+            return bool(cur.fetchone()[0])
+    return _with_conn(_run)
+
+
+def rename_user(old_username: str, new_username: str) -> None:
+    """
+    Rename a user atomically: insert new record, migrate all child rows, delete old.
+    Raises ValueError if new_username already exists.
+    """
+    def _run(conn):
+        with conn.cursor() as cur:
+            # Guard: ensure new username doesn't already exist
+            cur.execute("SELECT 1 FROM users WHERE username = %s", (new_username,))
+            if cur.fetchone():
+                raise ValueError(f"Username '{new_username}' already exists")
+
+            # Insert new user row (copy from old)
+            cur.execute("""
+                INSERT INTO users
+                    (username, password_hash, salt, totp_secret, totp_enabled, email, created_at)
+                SELECT %s, password_hash, salt, totp_secret, totp_enabled, email, created_at
+                FROM users WHERE username = %s
+            """, (new_username, old_username))
+
+            # Update all child tables
+            for table in ("tw_transactions", "us_holdings", "pledge_loans",
+                          "user_config", "portfolio_history"):
+                cur.execute(
+                    f"UPDATE {table} SET username = %s WHERE username = %s",
+                    (new_username, old_username),
+                )
+
+            # Delete old user (no child rows remain, no cascade needed)
+            cur.execute("DELETE FROM users WHERE username = %s", (old_username,))
+
+    _with_conn(_run)

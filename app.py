@@ -19,8 +19,7 @@ from config.settings import (
     TW_TICKERS, US_TICKERS,
 )
 from utils.auth import (
-    has_users, create_user, verify_password, verify_totp,
-    is_totp_enabled, get_totp_qr_bytes, logout,
+    has_users, create_user, verify_password, logout,
     update_profile, get_profile,
 )
 from utils.data_loader import (
@@ -29,6 +28,7 @@ from utils.data_loader import (
     load_us_cost_twd, save_us_cost_twd,
     _read_csv_bytes, _is_dazhangdan, _is_fuzhuotuo,
     _parse_dazhangdan_rows, _parse_fuzhuotuo,
+    validate_csv_upload,
 )
 import utils.db as db
 from utils.price_fetcher import (
@@ -170,19 +170,12 @@ def show_auth():
         with st.form("login"):
             uname = st.text_input("Username")
             pw    = st.text_input("Password", type="password")
-            code  = st.text_input("2FA Code", placeholder="6-digit Google Authenticator code",
-                                  max_chars=6)
             ok    = st.form_submit_button("Sign In", use_container_width=True, type="primary")
         if ok:
             if not has_users():
                 st.error("No accounts found. Please create one first."); return
             if not verify_password(uname, pw):
                 st.error("Invalid username or password"); return
-            if is_totp_enabled(uname):
-                if not code:
-                    st.warning("Please enter your 2FA code"); return
-                if not verify_totp(uname, code):
-                    st.error("Invalid or expired 2FA code"); return
             st.session_state.authenticated = True
             st.session_state.username = uname
             st.rerun()
@@ -195,7 +188,6 @@ def show_auth():
             email2 = st.text_input("Email (optional)")
             pw2a   = st.text_input("Password (min 8 chars)", type="password")
             pw2b   = st.text_input("Confirm password", type="password")
-            totp2  = st.checkbox("Enable Google Authenticator (2FA)", value=True)
             ok2    = st.form_submit_button("Create Account", use_container_width=True,
                                            type="primary")
         if ok2:
@@ -205,19 +197,10 @@ def show_auth():
                 st.error("Password must be at least 8 characters"); return
             if pw2a != pw2b:
                 st.error("Passwords do not match"); return
-            success, secret = create_user(uname2, pw2a, totp2, email2)
+            success, _ = create_user(uname2, pw2a, totp_enabled=False, email=email2)
             if not success:
                 st.error("Username already exists"); return
-            st.success(f"Account **{uname2}** created!")
-            if totp2 and secret:
-                st.markdown("#### Scan QR code with Google Authenticator")
-                c1, c2 = st.columns([1, 2])
-                with c1:
-                    st.image(get_totp_qr_bytes(uname2, secret), width=180)
-                with c2:
-                    st.code(secret)
-                    st.caption("Scan with Google Authenticator / Authy, or enter the key manually.")
-                st.warning("Complete the 2FA setup before signing in.")
+            st.success(f"✅ Account **{uname2}** created! Please sign in.")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -303,30 +286,30 @@ def _chart_price(hist: pd.DataFrame, sym: str, cost_price=None,
 
 
 def _chart_pnl_level(series: pd.Series, title: str):
-    """Area + line chart showing absolute unrealized P&L level over time."""
+    """Line + point chart showing absolute unrealized P&L level over time.
+    Y-axis scales to data range (does not force zero as minimum).
+    """
     df = series.reset_index()
     df.columns = ["date", "pnl"]
     clr = COLOR_POSITIVE if df["pnl"].iloc[-1] >= 0 else COLOR_NEGATIVE
 
-    base = alt.Chart(df).encode(x=alt.X("date:T", title=None))
-    area = base.mark_area(opacity=0.12, interpolate="monotone",
-                          color=clr)
-    line = base.mark_line(strokeWidth=2, interpolate="monotone",
-                          color=clr).encode(
-        y=alt.Y("pnl:Q", title="NT$", axis=alt.Axis(format=",.0f")),
-        tooltip=[
-            alt.Tooltip("date:T", format="%Y-%m-%d"),
-            alt.Tooltip("pnl:Q", format="+,.0f", title="NT$"),
-        ],
-    )
-    area = area.encode(
-        y=alt.Y("pnl:Q", title="NT$", axis=alt.Axis(format=",.0f")),
-    )
-    zero = alt.Chart(pd.DataFrame([{"y": 0}])).mark_rule(
-        color="rgba(255,255,255,0.2)"
+    y_enc = alt.Y("pnl:Q", title="NT$",
+                  scale=alt.Scale(zero=False),
+                  axis=alt.Axis(format=",.0f"))
+    tooltip = [
+        alt.Tooltip("date:T", format="%Y-%m-%d"),
+        alt.Tooltip("pnl:Q", format="+,.0f", title="NT$"),
+    ]
+    base  = alt.Chart(df).encode(x=alt.X("date:T", title=None))
+    line  = base.mark_line(strokeWidth=2, interpolate="monotone",
+                           color=clr).encode(y=y_enc, tooltip=tooltip)
+    points = base.mark_point(filled=True, size=55, color=clr,
+                             opacity=0.9).encode(y=y_enc, tooltip=tooltip)
+    zero  = alt.Chart(pd.DataFrame([{"y": 0}])).mark_rule(
+        color="rgba(255,255,255,0.2)", strokeDash=[4, 4]
     ).encode(y="y:Q")
 
-    return alt.layer(area, line, zero).properties(height=220, title=title)
+    return alt.layer(line, points, zero).properties(height=220, title=title)
 
 
 def _chart_pnl_bars(series: pd.Series, title: str):
@@ -430,76 +413,19 @@ def _chart_pledge_gauge(ratio: float):
 # DASHBOARD
 # ═════════════════════════════════════════════════════════════════════════════
 def render_dashboard():
-    username = st.session_state.username
+    username  = st.session_state.username
+    _has_data = db.has_user_data(username)
 
-    # ── Load US cost basis (editable, persisted in DB) ────────────────────────
-    _us_cost_twd = load_us_cost_twd(username)
-
-    # ── Load holdings ─────────────────────────────────────────────────────────
-    tw_h = load_tw_holdings(username)
-    us_h = load_us_holdings(username)
-    all_syms = tuple(h["symbol"] for h in tw_h + us_h)
-
-    # ── Fetch prices ──────────────────────────────────────────────────────────
-    with st.spinner("Fetching live prices…"):
-        prices, price_dates = fetch_current_prices(all_syms)
-        usd_twd = fetch_usd_twd_rate()
-
-    tw_e = enrich_holdings(tw_h, prices, usd_twd)
-    us_e = enrich_holdings(us_h, prices, usd_twd)
-
-    # ── Override US cost basis with actual TWD invested ───────────────────────
-    # The 複委託庫存 avg_cost is in USD; the real TWD cost is stored in config.
-    # Distribute it proportionally by each symbol's USD cost share.
-    if _us_cost_twd > 0:
-        _us_usd_total = sum(h["cost_basis"] or 0 for h in us_e)
-        if _us_usd_total > 0:
-            for h in us_e:
-                _frac               = (h["cost_basis"] or 0) / _us_usd_total
-                h["cost_basis_twd"] = _us_cost_twd * _frac
-                h["unrealized_pnl_twd"] = (
-                    (h["market_value_twd"] or 0) - h["cost_basis_twd"]
-                )
-                h["pnl_pct"] = (
-                    h["unrealized_pnl_twd"] / h["cost_basis_twd"] * 100
-                    if h["cost_basis_twd"] > 0 else 0.0
-                )
-
-    summary = portfolio_summary(tw_e, us_e)
-
-    # Compute adjusted portfolio totals — TW sell-cost factor applied to match Holdings table
-    tw_cb      = sum(h["cost_basis_twd"]    or 0 for h in tw_e)
-    tw_mv      = sum((h["market_value_twd"] or 0) * TW_SELL_FACTOR for h in tw_e)
-    us_cb      = sum(h["cost_basis_twd"]    or 0 for h in us_e)
-    us_mv_twd  = sum(h["market_value_twd"]  or 0 for h in us_e)
-    us_mv_usd  = sum(h["market_value"]      or 0 for h in us_e)
-    total_val  = tw_mv + us_mv_twd
-    total_cb   = tw_cb + us_cb
-    pnl        = total_val - total_cb
-    pnl_pct    = pnl / total_cb * 100 if total_cb > 0 else 0.0
-    us_pnl_twd = us_mv_twd - us_cb
-
-    if total_val > 0:
-        save_snapshot(username, total_val, pnl, pnl_pct)
-
-    # ── Header ────────────────────────────────────────────────────────────────
+    # ── Header (always visible) ───────────────────────────────────────────────
     h1, h2, h3 = st.columns([5, 1.5, 1])
     with h1:
         _now8 = datetime.now(_TZ8).strftime('%Y/%m/%d %H:%M')
-        _tw_price_date = next(
-            (price_dates.get(h["symbol"]) for h in tw_h if price_dates.get(h["symbol"])), "—")
-        _us_price_date = next(
-            (price_dates.get(h["symbol"]) for h in us_h if price_dates.get(h["symbol"])), "—")
         st.markdown(
             "<div style='font-size:1.4rem;font-weight:700'>📈 Portfolio Dashboard</div>"
-            f"<div style='font-size:0.78rem;color:#8B949E'>"
-            f"Updated: {_now8} (UTC+8)"
-            f"&nbsp;&nbsp;|&nbsp;&nbsp;TW as of {_tw_price_date}"
-            f"&nbsp;&nbsp;|&nbsp;&nbsp;US as of {_us_price_date}"
-            f"&nbsp;&nbsp;|&nbsp;&nbsp;USD/TWD: {usd_twd:.2f} (Cathay)</div>",
+            f"<div style='font-size:0.78rem;color:#8B949E'>Updated: {_now8} (UTC+8)</div>",
             unsafe_allow_html=True)
     with h2:
-        if st.button("🔄 Refresh Prices", use_container_width=True, type="secondary"):
+        if st.button("🔄 Refresh", use_container_width=True, type="secondary"):
             st.cache_data.clear()
             st.rerun()
     with h3:
@@ -508,32 +434,90 @@ def render_dashboard():
 
     st.markdown("<div class='divider'></div>", unsafe_allow_html=True)
 
-    # ── KPIs — all values use TW sell-cost factor, matching Holdings table ─────
-    k1, k2, k3, k4, k5, k6 = st.columns(6)
-    k1.metric("Total Value",           fmt(total_val),
-              " ", delta_color="off")
-    k2.metric("Unrealized P&L",        fmt(pnl),
-              f"{pnl_pct:+.2f}%", delta_color=dc(pnl))
-    k3.metric("TW Cost Basis",         fmt(tw_cb),
-              " ", delta_color="off")
-    k4.metric("TW Market Value",       fmt(tw_mv),
-              fmtpnl(tw_mv - tw_cb), delta_color=dc(tw_mv - tw_cb))
-    k5.metric("US Cost Basis (TWD)",   fmt(us_cb),
-              " ", delta_color="off")
-    k6.metric("US Market Value (USD)", fmt(us_mv_usd, prefix="$"),
-              fmtpnl(us_pnl_twd), delta_color=dc(us_pnl_twd))
+    # ── Tabs: Dashboard only shown after data is uploaded ─────────────────────
+    if _has_data:
+        tab_dash, tab_upload, tab_account = st.tabs(
+            ["📊 Dashboard", "📤 Upload", "👤 Account"])
+    else:
+        tab_upload, tab_account = st.tabs(["📤 Upload", "👤 Account"])
 
-    st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
+    # ── Dashboard tab (only when data exists) ─────────────────────────────────
+    if _has_data:
+        with tab_dash:
+            _us_cost_twd = load_us_cost_twd(username)
+            tw_h = load_tw_holdings(username)
+            us_h = load_us_holdings(username)
+            all_syms = tuple(h["symbol"] for h in tw_h + us_h)
 
-    # ── Three tabs ────────────────────────────────────────────────────────────
-    tab_dash, tab_upload, tab_account = st.tabs(
-        ["📊 Dashboard", "📤 Upload", "👤 Account"])
+            with st.spinner("Fetching live prices…"):
+                prices, price_dates = fetch_current_prices(all_syms)
+                usd_twd = fetch_usd_twd_rate()
 
-    with tab_dash:
-        _section_charts(tw_e, us_e, summary)
-        _section_holdings(tw_e, us_e, _us_cost_twd)
-        _section_pnl_history(tw_h, us_h, _us_cost_twd)
-        _section_pledge(prices, usd_twd)
+            tw_e = enrich_holdings(tw_h, prices, usd_twd)
+            us_e = enrich_holdings(us_h, prices, usd_twd)
+
+            # Override US cost basis with actual TWD invested
+            if _us_cost_twd > 0:
+                _us_usd_total = sum(h["cost_basis"] or 0 for h in us_e)
+                if _us_usd_total > 0:
+                    for h in us_e:
+                        _frac               = (h["cost_basis"] or 0) / _us_usd_total
+                        h["cost_basis_twd"] = _us_cost_twd * _frac
+                        h["unrealized_pnl_twd"] = (
+                            (h["market_value_twd"] or 0) - h["cost_basis_twd"]
+                        )
+                        h["pnl_pct"] = (
+                            h["unrealized_pnl_twd"] / h["cost_basis_twd"] * 100
+                            if h["cost_basis_twd"] > 0 else 0.0
+                        )
+
+            summary = portfolio_summary(tw_e, us_e)
+
+            # Adjusted totals — TW sell-cost factor applied to match Holdings table
+            tw_cb      = sum(h["cost_basis_twd"]    or 0 for h in tw_e)
+            tw_mv      = sum((h["market_value_twd"] or 0) * TW_SELL_FACTOR for h in tw_e)
+            us_cb      = sum(h["cost_basis_twd"]    or 0 for h in us_e)
+            us_mv_twd  = sum(h["market_value_twd"]  or 0 for h in us_e)
+            us_mv_usd  = sum(h["market_value"]      or 0 for h in us_e)
+            total_val  = tw_mv + us_mv_twd
+            total_cb   = tw_cb + us_cb
+            pnl        = total_val - total_cb
+            pnl_pct    = pnl / total_cb * 100 if total_cb > 0 else 0.0
+            us_pnl_twd = us_mv_twd - us_cb
+
+            if total_val > 0:
+                save_snapshot(username, total_val, pnl, pnl_pct)
+
+            # Price date subtitle
+            _tw_date = next(
+                (price_dates.get(h["symbol"]) for h in tw_h if price_dates.get(h["symbol"])), "—")
+            _us_date = next(
+                (price_dates.get(h["symbol"]) for h in us_h if price_dates.get(h["symbol"])), "—")
+            st.caption(
+                f"TW as of {_tw_date} | US as of {_us_date} | USD/TWD: {usd_twd:.2f} (Cathay)"
+            )
+
+            # KPIs — equal height via delta=non-breaking-space on non-delta metrics
+            k1, k2, k3, k4, k5, k6 = st.columns(6)
+            k1.metric("Total Value",           fmt(total_val),
+                      " ", delta_color="off")
+            k2.metric("Unrealized P&L",        fmt(pnl),
+                      f"{pnl_pct:+.2f}%", delta_color=dc(pnl))
+            k3.metric("TW Cost Basis",         fmt(tw_cb),
+                      " ", delta_color="off")
+            k4.metric("TW Market Value",       fmt(tw_mv),
+                      fmtpnl(tw_mv - tw_cb), delta_color=dc(tw_mv - tw_cb))
+            k5.metric("US Cost Basis (TWD)",   fmt(us_cb),
+                      " ", delta_color="off")
+            k6.metric("US Market Value (USD)", fmt(us_mv_usd, prefix="$"),
+                      fmtpnl(us_pnl_twd), delta_color=dc(us_pnl_twd))
+
+            st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
+
+            _section_charts(tw_e, us_e, summary)
+            _section_holdings(tw_e, us_e, _us_cost_twd)
+            _section_pnl_history(tw_h, us_h, _us_cost_twd)
+            _section_pledge(prices, usd_twd)
 
     with tab_upload:
         _tab_upload()
@@ -553,8 +537,10 @@ def _tab_account():
                 unsafe_allow_html=True)
 
     c1, c2 = st.columns([1, 1])
+
+    # ── Column 1: Change password / email ─────────────────────────────────────
     with c1:
-        st.markdown(f"**Change Password — {uname}**")
+        st.markdown(f"**Password & Email — {uname}**")
         with st.form("account_pw_form"):
             new_email = st.text_input("Email", value=profile.get("email", ""))
             new_pw    = st.text_input("New password (leave blank to keep)",
@@ -573,10 +559,31 @@ def _tab_account():
                     st.success("Changes saved!")
                     st.rerun()
 
+        # ── Change username ────────────────────────────────────────────────────
+        st.markdown("**Change Username**")
+        with st.form("account_uname_form"):
+            new_uname = st.text_input("New username",
+                                      placeholder="Must be unique, min 2 chars")
+            if st.form_submit_button("Change Username", type="secondary",
+                                     use_container_width=True):
+                new_uname = new_uname.strip()
+                if len(new_uname) < 2:
+                    st.error("Username must be at least 2 characters")
+                elif new_uname == uname:
+                    st.error("New username is the same as current")
+                else:
+                    try:
+                        db.rename_user(uname, new_uname)
+                        st.session_state.username = new_uname
+                        st.success(f"Username changed to **{new_uname}**")
+                        st.rerun()
+                    except ValueError as e:
+                        st.error(str(e))
+
+    # ── Column 2: Account info ─────────────────────────────────────────────────
     with c2:
         st.markdown("**Account Info**")
         st.write(f"**Username:** {uname}")
-        st.write(f"**2FA:** {'✅ Enabled' if profile.get('totp_enabled') else '❌ Disabled'}")
         if profile.get("email"):
             st.write(f"**Email:** {profile['email']}")
 
@@ -941,7 +948,9 @@ def _section_pledge(prices, usd_twd):
         # ── Highlight 2: Total Loan Amount (incl. interest) ───────────────────
         # ── Highlight 3: Overall Maintenance Ratio ────────────────────────────
         m1, m2, m3 = st.columns(3)
-        m1.metric("Pledged Stock Value", fmt(total_pledge_value))
+        # All three metrics get a delta row so card heights are equal
+        m1.metric("Pledged Stock Value", fmt(total_pledge_value),
+                  "\xa0", delta_color="off")
         m2.metric(
             "Total Loan Amount (incl. Interest)",
             fmt(total_liability),
@@ -961,7 +970,8 @@ def _section_pledge(prices, usd_twd):
                       r_delta, delta_color=r_dc)
         else:
             m3.metric("Overall Maintenance Ratio",
-                      "—" if any_price_missing else fmt(0))
+                      "—" if any_price_missing else fmt(0),
+                      "\xa0", delta_color="off")
             if any_price_missing:
                 st.caption("⚠️ Some prices unavailable — ratio cannot be calculated")
 
@@ -1047,38 +1057,110 @@ def _tab_upload():
     uc1, uc2 = st.columns(2)
 
     with uc1:
-        st.caption("**TW Stocks** — 國泰證券 對帳單 (transaction history)")
-        up_tw = st.file_uploader("TW CSV", type=["csv"], key="up_tw")
-        if up_tw:
-            df = _read_csv_bytes(io.BytesIO(up_tw.getvalue()))
-            if df is not None and _is_dazhangdan(df):
+        st.caption(
+            "**TW Stocks** — 國泰證券 對帳單（可同時上傳多個 CSV，自動合併去重後寫入）"
+        )
+        up_tw_files = st.file_uploader(
+            "TW CSV", type=["csv"], key="up_tw", accept_multiple_files=True
+        )
+        if up_tw_files:
+            all_rows = []
+            errors   = []
+            for f in up_tw_files:
+                buf  = io.BytesIO(f.getvalue())
+                ok, err = validate_csv_upload(buf, f.name)
+                if not ok:
+                    errors.append(err); continue
+                buf.seek(0)
+                df = _read_csv_bytes(buf)
+                if df is None or not _is_dazhangdan(df):
+                    errors.append(
+                        f"{f.name}：格式不符（需含欄位：股名、日期、成交股數、淨收付）"
+                    )
+                    continue
                 rows = _parse_dazhangdan_rows(df)
-                if rows:
-                    db.replace_tw_transactions(username, rows)
-                    st.cache_data.clear()
-                    st.success(f"✅ 已匯入 {len(rows)} 筆交易紀錄")
-                    st.rerun()
-                else:
-                    st.warning("CSV 解析成功但無有效交易資料（請確認欄位名稱與日期設定）。")
-            else:
-                st.error("無法識別 CSV 格式。請上傳國泰證券「對帳單」格式（需含欄位：股名、日期、成交股數、淨收付）。")
+                if not rows:
+                    errors.append(f"{f.name}：無符合條件的交易資料")
+                    continue
+                all_rows.extend(rows)
+
+            if errors:
+                for e in errors:
+                    st.error(e)
+
+            if all_rows:
+                # Dedup by (symbol, trade_date, share_delta, cost_flow)
+                seen, deduped = set(), []
+                for r in all_rows:
+                    key = (r["symbol"], r["trade_date"],
+                           round(r["share_delta"], 4), round(r["cost_flow"], 4))
+                    if key not in seen:
+                        seen.add(key)
+                        deduped.append(r)
+                db.replace_tw_transactions(username, deduped)
+                st.cache_data.clear()
+                st.success(
+                    f"✅ 已匯入 {len(deduped)} 筆交易紀錄"
+                    + (f"（來自 {len(up_tw_files)} 個檔案，去重後）" if len(up_tw_files) > 1 else "")
+                )
+                st.rerun()
 
     with uc2:
-        st.caption("**US Stocks** — 複委託庫存 (holdings snapshot)")
-        up_us = st.file_uploader("US CSV", type=["csv"], key="up_us")
-        if up_us:
-            df = _read_csv_bytes(io.BytesIO(up_us.getvalue()))
-            if df is not None and _is_fuzhuotuo(df):
+        st.caption(
+            "**US Stocks** — 複委託庫存（可同時上傳多個 CSV，相同代號以最後一個檔案為準）"
+        )
+        up_us_files = st.file_uploader(
+            "US CSV", type=["csv"], key="up_us", accept_multiple_files=True
+        )
+        if up_us_files:
+            merged: dict = {}   # symbol → holding dict (last file wins)
+            errors  = []
+            for f in up_us_files:
+                buf  = io.BytesIO(f.getvalue())
+                ok, err = validate_csv_upload(buf, f.name)
+                if not ok:
+                    errors.append(err); continue
+                buf.seek(0)
+                df = _read_csv_bytes(buf)
+                if df is None or not _is_fuzhuotuo(df):
+                    errors.append(
+                        f"{f.name}：格式不符（需含欄位：代號、目前庫存、均價）"
+                    )
+                    continue
                 holdings = _parse_fuzhuotuo(df) or []
-                if holdings:
-                    db.replace_us_holdings(username, holdings)
-                    st.cache_data.clear()
-                    st.success(f"✅ 已匯入 {len(holdings)} 筆美股庫存")
-                    st.rerun()
-                else:
-                    st.warning("CSV 解析成功但無有效庫存資料（請確認庫存數量 > 0）。")
-            else:
-                st.error("無法識別 CSV 格式。請上傳「複委託庫存」格式（需含欄位：代號、目前庫存、均價）。")
+                if not holdings:
+                    errors.append(f"{f.name}：無有效庫存資料（庫存數量需 > 0）")
+                    continue
+                for h in holdings:
+                    merged[h["symbol"]] = h   # last file wins for duplicate symbols
+
+            if errors:
+                for e in errors:
+                    st.error(e)
+
+            if merged:
+                all_holdings = list(merged.values())
+                db.replace_us_holdings(username, all_holdings)
+
+                # Auto-compute us_twd_cost from CSV: shares × avg_cost × FX rate
+                usd_twd = fetch_usd_twd_rate()
+                auto_cost = sum(
+                    h["shares"] * h["cost_per_share"] for h in all_holdings
+                ) * usd_twd
+                if auto_cost > 0:
+                    save_us_cost_twd(username, round(auto_cost, 2))
+
+                st.cache_data.clear()
+                st.success(
+                    f"✅ 已匯入 {len(all_holdings)} 筆美股庫存"
+                    + (f"（來自 {len(up_us_files)} 個檔案）" if len(up_us_files) > 1 else "")
+                )
+                if auto_cost > 0:
+                    st.caption(
+                        f"US Cost Basis 已自動設為 NT${auto_cost:,.0f}（均價 × 股數 × {usd_twd:.2f}），"
+                        "如有需要可至 Dashboard → Holdings 手動修改。"
+                    )
+                st.rerun()
 
 
 # ═════════════════════════════════════════════════════════════════════════════

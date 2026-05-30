@@ -11,8 +11,9 @@ utils.db (Neon PostgreSQL) instead of local CSV files.
 """
 
 import io
+import re
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import pandas as pd
 
@@ -57,6 +58,48 @@ _US_COL_ALIASES = {
     "total_cost": ["total cost", "total cost (usd)", "投資成本", "cost_amount",
                    "庫存成本"],
 }
+
+
+# ── Upload validation constants ───────────────────────────────────────────────
+_MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024   # 10 MB
+_MAX_ROWS            = 10_000
+_MAX_COLUMNS         = 60
+_MAX_STRING_LEN      = 500
+# Allow: Chinese, alphanumeric, spaces, dots, slashes, hyphens, underscores
+_SAFE_SYMBOL_RE      = re.compile(r'^[\w一-鿿\s\.\-/\(\)]+$')
+
+
+def validate_csv_upload(buf: io.BytesIO, label: str) -> Tuple[bool, str]:
+    """
+    Validate a CSV upload buffer before parsing into the DB.
+    Returns (is_valid, error_message). error_message is '' when valid.
+    Checks: file size, row count, column count, parsability.
+    SQL injection is already prevented by parameterized queries in db.py.
+    """
+    # Size check
+    buf.seek(0, 2)
+    size = buf.tell()
+    buf.seek(0)
+    if size == 0:
+        return False, f"{label}：檔案是空的"
+    if size > _MAX_FILE_SIZE_BYTES:
+        mb = size / 1024 / 1024
+        return False, f"{label}：檔案過大（{mb:.1f} MB，上限 10 MB）"
+
+    # Parsability check
+    df = _read_csv_bytes(buf)
+    if df is None:
+        return False, f"{label}：無法解析 CSV（請確認編碼為 UTF-8、Big5 或 CP950）"
+
+    # Structure checks
+    if len(df) == 0:
+        return False, f"{label}：CSV 無任何資料列"
+    if len(df) > _MAX_ROWS:
+        return False, f"{label}：資料列數過多（{len(df):,} 列，上限 {_MAX_ROWS:,} 列）"
+    if len(df.columns) > _MAX_COLUMNS:
+        return False, f"{label}：欄位數過多（{len(df.columns)} 欄）"
+
+    return True, ""
 
 
 # ── Low-level helpers ─────────────────────────────────────────────────────────
