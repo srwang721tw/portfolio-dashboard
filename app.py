@@ -446,7 +446,7 @@ def render_dashboard():
 
     # ── Fetch prices ──────────────────────────────────────────────────────────
     with st.spinner("Fetching live prices…"):
-        prices  = fetch_current_prices(all_syms)
+        prices, price_dates = fetch_current_prices(all_syms)
         usd_twd = fetch_usd_twd_rate()
 
     tw_e = enrich_holdings(tw_h, prices, usd_twd)
@@ -470,19 +470,37 @@ def render_dashboard():
                 )
 
     summary = portfolio_summary(tw_e, us_e)
-    if summary["total_value_twd"] > 0:
-        save_snapshot(summary["total_value_twd"], summary["total_pnl_twd"],
-                      summary["pnl_pct"])
+
+    # Compute adjusted portfolio totals — TW sell-cost factor applied to match Holdings table
+    tw_cb      = sum(h["cost_basis_twd"]    or 0 for h in tw_e)
+    tw_mv      = sum((h["market_value_twd"] or 0) * TW_SELL_FACTOR for h in tw_e)
+    us_cb      = sum(h["cost_basis_twd"]    or 0 for h in us_e)
+    us_mv_twd  = sum(h["market_value_twd"]  or 0 for h in us_e)
+    us_mv_usd  = sum(h["market_value"]      or 0 for h in us_e)
+    total_val  = tw_mv + us_mv_twd
+    total_cb   = tw_cb + us_cb
+    pnl        = total_val - total_cb
+    pnl_pct    = pnl / total_cb * 100 if total_cb > 0 else 0.0
+    us_pnl_twd = us_mv_twd - us_cb
+
+    if total_val > 0:
+        save_snapshot(total_val, pnl, pnl_pct)
 
     # ── Header ────────────────────────────────────────────────────────────────
     h1, h2, h3 = st.columns([5, 1.5, 1])
     with h1:
         _now8 = datetime.now(_TZ8).strftime('%Y/%m/%d %H:%M')
+        _tw_price_date = next(
+            (price_dates.get(h["symbol"]) for h in tw_h if price_dates.get(h["symbol"])), "—")
+        _us_price_date = next(
+            (price_dates.get(h["symbol"]) for h in us_h if price_dates.get(h["symbol"])), "—")
         st.markdown(
             "<div style='font-size:1.4rem;font-weight:700'>📈 Portfolio Dashboard</div>"
             f"<div style='font-size:0.78rem;color:#8B949E'>"
             f"Updated: {_now8} (UTC+8)"
-            f"&nbsp;&nbsp;USD/TWD: {usd_twd:.2f} (Cathay)</div>",
+            f"&nbsp;&nbsp;|&nbsp;&nbsp;TW as of {_tw_price_date}"
+            f"&nbsp;&nbsp;|&nbsp;&nbsp;US as of {_us_price_date}"
+            f"&nbsp;&nbsp;|&nbsp;&nbsp;USD/TWD: {usd_twd:.2f} (Cathay)</div>",
             unsafe_allow_html=True)
     with h2:
         if st.button("🔄 Refresh Prices", use_container_width=True, type="secondary"):
@@ -494,24 +512,19 @@ def render_dashboard():
 
     st.markdown("<div class='divider'></div>", unsafe_allow_html=True)
 
-    # ── KPIs ──────────────────────────────────────────────────────────────────
-    pnl    = summary["total_pnl_twd"]
-    tw_cb  = sum(h["cost_basis_twd"]    or 0 for h in tw_e)
-    tw_mv  = sum(h["market_value_twd"]  or 0 for h in tw_e)
-    us_cb  = sum(h["cost_basis_twd"]    or 0 for h in us_e)
-    us_mv_usd = sum(h["market_value"]   or 0 for h in us_e)
-    us_pnl_twd = sum(h["unrealized_pnl_twd"] or 0 for h in us_e)
-
+    # ── KPIs — all values use TW sell-cost factor, matching Holdings table ─────
     k1, k2, k3, k4, k5, k6 = st.columns(6)
-    k1.metric("Total Value",         fmt(summary["total_value_twd"]))
-    k2.metric("Unrealized P&L",      fmt(pnl),
-              f"{summary['pnl_pct']:+.2f}%", delta_color=dc(pnl))
-    k3.metric("TW Cost Basis",       fmt(tw_cb))
-    k4.metric("TW Market Value",     fmt(tw_mv),
+    k1.metric("Total Value",           fmt(total_val),
+              " ", delta_color="off")
+    k2.metric("Unrealized P&L",        fmt(pnl),
+              f"{pnl_pct:+.2f}%", delta_color=dc(pnl))
+    k3.metric("TW Cost Basis",         fmt(tw_cb),
+              " ", delta_color="off")
+    k4.metric("TW Market Value",       fmt(tw_mv),
               fmtpnl(tw_mv - tw_cb), delta_color=dc(tw_mv - tw_cb))
-    k5.metric("US Cost Basis (TWD)", fmt(us_cb))
-    k6.metric("US Market Value (USD)",
-              fmt(us_mv_usd, prefix="$"),
+    k5.metric("US Cost Basis (TWD)",   fmt(us_cb),
+              " ", delta_color="off")
+    k6.metric("US Market Value (USD)", fmt(us_mv_usd, prefix="$"),
               fmtpnl(us_pnl_twd), delta_color=dc(us_pnl_twd))
 
     st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
@@ -910,7 +923,7 @@ def _section_pledge(prices, usd_twd):
     else:
         p_syms   = tuple({s["symbol"] for loan in loans
                           for s in loan.get("pledged_stocks", [])})
-        p_prices = fetch_current_prices(p_syms) if p_syms else {}
+        p_prices, _ = fetch_current_prices(p_syms) if p_syms else ({}, {})
 
         total_pledge_value   = 0.0
         total_loan_principal = 0.0

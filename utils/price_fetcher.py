@@ -28,16 +28,28 @@ def _yf(symbol: str) -> str:
 
 
 @st.cache_data(ttl=PRICE_CACHE_TTL, show_spinner=False)
-def fetch_current_prices(symbols: Tuple[str, ...]) -> Dict[str, Optional[float]]:
-    """Fetch latest close price for each symbol via individual Ticker calls."""
+def fetch_current_prices(symbols: Tuple[str, ...]) -> Tuple[Dict[str, Optional[float]], Dict[str, Optional[str]]]:
+    """Fetch latest close price and trading date for each symbol via individual Ticker calls.
+
+    Returns (prices, dates) where dates are the local market date of the last close.
+    Uses period='7d' to reduce the chance of missing the latest trading day.
+    """
     prices: Dict[str, Optional[float]] = {}
+    dates:  Dict[str, Optional[str]]  = {}
     for sym in symbols:
         try:
-            hist = yf.Ticker(_yf(sym)).history(period="5d")
-            prices[sym] = float(hist["Close"].dropna().iloc[-1]) if not hist.empty else None
+            hist  = yf.Ticker(_yf(sym)).history(period="7d")
+            close = hist["Close"].dropna() if not hist.empty else pd.Series(dtype=float)
+            if not close.empty:
+                prices[sym] = float(close.iloc[-1])
+                dates[sym]  = pd.Timestamp(close.index[-1]).strftime("%Y-%m-%d")
+            else:
+                prices[sym] = None
+                dates[sym]  = None
         except Exception:
             prices[sym] = None
-    return prices
+            dates[sym]  = None
+    return prices, dates
 
 
 @st.cache_data(ttl=PRICE_CACHE_TTL, show_spinner=False)
