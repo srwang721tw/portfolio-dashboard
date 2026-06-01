@@ -288,6 +288,9 @@ def _chart_price(hist: pd.DataFrame, sym: str, cost_price=None,
 def _chart_pnl_level(series: pd.Series, title: str):
     """Line + point chart showing absolute unrealized P&L level over time.
     Y-axis scales to data range (does not force zero as minimum).
+    The zero reference line is only added when the data crosses the zero boundary;
+    including it unconditionally would force Vega-Lite to extend the Y domain to 0,
+    defeating the zero=False setting and making the trend appear flat.
     """
     df = series.reset_index()
     df.columns = ["date", "pnl"]
@@ -300,16 +303,23 @@ def _chart_pnl_level(series: pd.Series, title: str):
         alt.Tooltip("date:T", format="%Y-%m-%d"),
         alt.Tooltip("pnl:Q", format="+,.0f", title="NT$"),
     ]
-    base  = alt.Chart(df).encode(x=alt.X("date:T", title=None))
-    line  = base.mark_line(strokeWidth=2, interpolate="monotone",
-                           color=clr).encode(y=y_enc, tooltip=tooltip)
+    base   = alt.Chart(df).encode(x=alt.X("date:T", title=None))
+    line   = base.mark_line(strokeWidth=2, interpolate="monotone",
+                            color=clr).encode(y=y_enc, tooltip=tooltip)
     points = base.mark_point(filled=True, size=55, color=clr,
                              opacity=0.9).encode(y=y_enc, tooltip=tooltip)
-    zero  = alt.Chart(pd.DataFrame([{"y": 0}])).mark_rule(
-        color="rgba(255,255,255,0.2)", strokeDash=[4, 4]
-    ).encode(y="y:Q")
+    layers = [line, points]
 
-    return alt.layer(line, points, zero).properties(height=220, title=title)
+    # Only overlay the zero baseline when it falls within the visible data range.
+    # If layered unconditionally, Vega-Lite pulls the Y domain to include 0 and
+    # the trend looks artificially flat.
+    if df["pnl"].min() < 0 < df["pnl"].max():
+        zero = alt.Chart(pd.DataFrame([{"y": 0}])).mark_rule(
+            color="rgba(255,255,255,0.2)", strokeDash=[4, 4]
+        ).encode(y="y:Q")
+        layers.append(zero)
+
+    return alt.layer(*layers).properties(height=220, title=title)
 
 
 def _chart_pnl_bars(series: pd.Series, title: str):
@@ -931,7 +941,12 @@ def _section_pledge(prices, usd_twd):
                 start_date=loan.get("date", ""),
                 override_accrued=float(stored) if stored is not None else None,
             )
-            if ratio is None:
+            # ratio is None for two distinct reasons:
+            #   1. Price unavailable  → compute_pledge_ratio returns (None, 0.0, 0.0)
+            #   2. Zero-loan pledge   → returns (None, total_value, accrued)
+            #      (stocks pledged without borrowing, used to boost overall ratio)
+            # Only set any_price_missing for case 1 (p_value stays 0 when price fetch fails).
+            if ratio is None and p_value == 0.0 and loan.get("pledged_stocks"):
                 any_price_missing = True
             total_pledge_value   += p_value or 0
             total_loan_principal += loan["loan_amount_twd"]
