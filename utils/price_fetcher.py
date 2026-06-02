@@ -29,26 +29,42 @@ def _yf(symbol: str) -> str:
 
 @st.cache_data(ttl=PRICE_CACHE_TTL, show_spinner=False)
 def fetch_current_prices(symbols: Tuple[str, ...]) -> Tuple[Dict[str, Optional[float]], Dict[str, Optional[str]]]:
-    """Fetch latest close price and trading date for each symbol via individual Ticker calls.
+    """Fetch latest price and trading date for each symbol.
 
-    Returns (prices, dates) where dates are the local market date of the last close.
-    Uses period='7d' to reduce the chance of missing the latest trading day.
+    Primary:  Ticker.fast_info.last_price — updated during market hours,
+              reflects intraday price (~15 min delay via Yahoo Finance).
+    Secondary: history(period='5d') — provides the last trading date for the
+              UI caption ("TW as of …") and serves as price fallback if fast_info fails.
+    If both fail, price and date are set to None (displayed as '—').
     """
     prices: Dict[str, Optional[float]] = {}
     dates:  Dict[str, Optional[str]]  = {}
     for sym in symbols:
+        ticker = yf.Ticker(_yf(sym))
+        price: Optional[float] = None
+        date:  Optional[str]   = None
+
+        # Primary: fast_info.last_price (intraday-aware, single lightweight call)
         try:
-            hist  = yf.Ticker(_yf(sym)).history(period="7d")
+            lp = ticker.fast_info.last_price
+            if lp is not None and not pd.isna(lp):
+                price = float(lp)
+        except Exception:
+            pass
+
+        # Minimal history fetch: get last trading date; also fills price if fast_info failed
+        try:
+            hist  = ticker.history(period="5d")
             close = hist["Close"].dropna() if not hist.empty else pd.Series(dtype=float)
             if not close.empty:
-                prices[sym] = float(close.iloc[-1])
-                dates[sym]  = pd.Timestamp(close.index[-1]).strftime("%Y-%m-%d")
-            else:
-                prices[sym] = None
-                dates[sym]  = None
+                date = pd.Timestamp(close.index[-1]).strftime("%Y-%m-%d")
+                if price is None:
+                    price = float(close.iloc[-1])
         except Exception:
-            prices[sym] = None
-            dates[sym]  = None
+            pass
+
+        prices[sym] = price
+        dates[sym]  = date
     return prices, dates
 
 

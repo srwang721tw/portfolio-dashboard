@@ -663,8 +663,12 @@ def _section_holdings(tw_e, us_e, us_cost_twd: float):
             "Return":   f"{pct:+.2f}%" if pct is not None else "—",
         }
 
-    rows = ([_row(h, "TW") for h in tw_e] +
-            [_row(h, "US") for h in us_e])
+    # Sort each market group by ticker symbol (ascending) before building rows.
+    # Subtotal aggregations still use the original unsorted lists — order doesn't affect math.
+    tw_sorted = sorted(tw_e, key=lambda h: h["symbol"])
+    us_sorted = sorted(us_e, key=lambda h: h["symbol"])
+    rows = ([_row(h, "TW") for h in tw_sorted] +
+            [_row(h, "US") for h in us_sorted])
 
     # Subtotals — TW market value also gets the sell-cost factor applied
     def _subtotal_row(label, holdings_list):

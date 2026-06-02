@@ -295,7 +295,8 @@ Remove both files after confirming Railway deployment works end-to-end.
 
 ## Known Limitations
 
-- `TW_INCLUDE_FROM['0050'] = '2025-06-18'` is hardcoded — update if new 0050 lots are purchased from an earlier date that should be included.
+- `TW_INCLUDE_FROM` cutoff dates default to `None` (all history included). If you need to reset cost basis after fully selling and re-buying a ticker, set a cutoff date for that symbol in `utils/data_loader.py`.
+- `fetch_current_prices()` uses `fast_info.last_price` (intraday, ~15 min delay) then falls back to `history(period="5d")`. Yahoo Finance data for TW stocks may be unavailable outside market hours on some days.
 - Cathay Bank FX scraper silently falls back to yfinance if the page structure changes.
 - P&L history chart uses `current holdings × historical price` (not transaction-based running position) — acceptable for long-term ETF holds where position rarely changes.
 - Neon free tier auto-suspends after 5 min idle; first login after idle has ~0.5–2s cold-start delay. Handled by `_with_conn` reconnect logic.

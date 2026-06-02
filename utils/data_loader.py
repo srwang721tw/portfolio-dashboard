@@ -32,10 +32,13 @@ TW_NAME_TO_TICKER: Dict[str, str] = {
     '永豐優息存股':     '00907',
 }
 
-# Stocks to include and optional cutoff date (None = all history)
-# '0050' starts from 2025-06-18 because earlier lots were fully sold.
+# Stocks to include and optional cutoff date (None = all history).
+# Cutoff dates can be set per-symbol to ignore transactions before a given date —
+# useful if you re-buy a ticker after fully selling it and want to reset cost basis.
+# By default all dates are None; users manage their own inventory by uploading only
+# the transactions they want included.
 TW_INCLUDE_FROM: Dict[str, Optional[str]] = {
-    '0050':   '2025-06-18',
+    '0050':   None,
     '006208': None,
     '00713':  None,
 }
