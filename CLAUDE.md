@@ -14,9 +14,6 @@ streamlit run app.py
 
 # Create DB schema (one-time, idempotent)
 python setup_db.py
-
-# Migrate flat-file data to Neon (one-time historical migration)
-python migrate_to_neon.py
 ```
 
 No test suite exists. Verify changes by running the app locally.
@@ -30,8 +27,15 @@ Single-page Streamlit app (`app.py`) with a tab-based UI. All business logic liv
 ### Data flow
 
 ```
+Startup
+  └─ db.ensure_schema()          idempotent; wrapped in try/except to surface DB errors
+
 Login
-  └─ db.ensure_schema()          idempotent on every startup
+  └─ verify_password()           generic error message (no username enumeration)
+  └─ st.session_state._last_activity = time.time()
+
+render_dashboard()
+  └─ 30-min inactivity timeout   calls logout() + st.rerun() if expired
   └─ db.has_user_data(username)  determines which tabs to show
 
 Dashboard tab
@@ -42,13 +46,15 @@ Dashboard tab
   └─ price_fetcher.fetch_current_prices()   cached 300s
   └─ price_fetcher.fetch_usd_twd_rate()     cached 300s
   └─ portfolio_calc.enrich_holdings()
+  └─ _apply_us_cost_override()   redistribute fixed TWD cost basis proportionally
   └─ portfolio_calc.portfolio_summary()
   └─ history_manager.save_snapshot(username, ...)
        └─ db.upsert_history_snapshot()      rolling 730-day window
 
 P&L History tab
-  └─ price_fetcher.fetch_historical_prices()  cached 3600s
-  └─ portfolio_calc.compute_portfolio_history()
+  └─ _cached_history(tw_json, us_json, days, us_cost_twd)
+       └─ price_fetcher.fetch_historical_prices()  cached 3600s
+       └─ portfolio_calc.compute_portfolio_history()
 
 Upload tab
   └─ validate_csv_upload()         size, row count, parsability
@@ -124,6 +130,8 @@ On every US CSV upload, `us_twd_cost` is auto-computed as:
 ```
 Users can override this manually in the Holdings section.
 
+`_apply_us_cost_override(us_enriched, us_cost_twd)` in `app.py` redistributes the fixed TWD total proportionally across all US holdings by their USD cost fraction (in-place mutation).
+
 ### TW sell-cost factor
 
 ```python
@@ -157,7 +165,7 @@ HISTORY_CACHE_TTL = 3600  # 1 hour (historical price series)
 
 `fetch_usd_twd_rate()`: primary source is Cathay Bank's digital-channel billboard page (`pd.read_html` on the buying-rate row); yfinance `USDTWD=X` is the silent fallback.
 
-`_cached_history()` in `app.py` takes JSON-serialised holdings as arguments (hashable for Streamlit's cache) and calls `compute_portfolio_history()`.
+`_cached_history(tw_json, us_json, days, us_cost_twd)` in `app.py` takes JSON-serialised holdings as arguments (hashable for Streamlit's cache) and calls `compute_portfolio_history()`. The P&L history always uses current holdings × historical price — there is no transaction-based running position path.
 
 ### CSV validation
 
@@ -177,14 +185,15 @@ SQL injection is prevented by parameterised queries throughout `db.py` — no ad
 
 ### P&L history chart
 
-`_chart_pnl_level()` uses `mark_line + mark_point` (not `mark_area`) with `scale=alt.Scale(zero=False)` so the Y-axis range tracks actual data — small fluctuations are visible even when P&L is large and positive.
+`_chart_pnl_level()` uses `mark_line + mark_point` (not `mark_area`) with `scale=alt.Scale(zero=False)` so the Y-axis range tracks actual data — small fluctuations are visible even when P&L is large and positive. The zero baseline rule is only added when the data actually crosses zero; adding it unconditionally forces Vega-Lite to extend the Y domain to 0, defeating the `zero=False` setting.
 
 ### Pledge interest
 
-`override_interest_twd` stored per loan. When set (not None), it's used directly as the accrued interest. When None, interest is computed as:
-```
-principal × rate% × days_elapsed / 365
-```
+`_compute_loan_interest(principal, rate_pct, start_date, override)` in `utils/portfolio_calc.py` is the single authoritative implementation:
+- If `override` is not None, return it directly (manual input mode)
+- Otherwise compute `principal × rate% × days_elapsed / 365`
+
+Used by both `compute_pledge_ratio()` in `portfolio_calc.py` and `_loans_to_df()` in `app.py` (imported from `portfolio_calc`).
 
 ---
 
@@ -243,9 +252,12 @@ Detected by columns: `{'代號', '目前庫存', '均價'}`
 ## Authentication
 
 - **Algorithm**: PBKDF2-SHA256, 200,000 iterations, 32-byte random salt per user
-- **No 2FA**: `totp_enabled` defaults to `False` for all new accounts; login requires only username + password
-- **Session state**: `st.session_state.authenticated` and `st.session_state.username`; cleared on `logout()`
+- **No 2FA**: `totp_enabled` is always `False`; login requires only username + password
+- **Session timeout**: 30-minute inactivity timeout in `render_dashboard()` — clears session state and redirects to login
+- **Generic login errors**: The login form always shows "Invalid username or password" regardless of whether the username exists (prevents username enumeration)
+- **Session state**: `st.session_state.authenticated`, `st.session_state.username`, `st.session_state._last_activity`; all cleared on `logout()`
 - **Username change**: `db.rename_user()` in a single DB transaction (see above)
+- **Auth logging**: `utils/auth.py` uses Python `logging` — failed logins logged at WARNING, successful logins and account changes at INFO
 
 `utils/auth.py` has no file I/O — all reads/writes go through `utils/db.py`.
 
@@ -255,7 +267,9 @@ Detected by columns: `{'代號', '目前庫存', '均價'}`
 
 ```
 show_auth()               Login + Create Account forms
+_apply_us_cost_override() Redistribute fixed TWD cost basis across US holdings
 render_dashboard()
+  ├─ 30-min session timeout check
   ├─ header + Refresh / Sign Out buttons
   ├─ tab_dash  (only if has_user_data)
   │    ├─ KPI metrics row (6 columns)
@@ -280,16 +294,9 @@ Railway reads `railway.toml`. Required env vars in Railway dashboard:
 | `DATABASE_URL` | Neon PostgreSQL connection string (`postgresql://...?sslmode=require&channel_binding=require`) |
 | `APP_SECRET_KEY` | Random hex string for session security |
 
-The app calls `db.ensure_schema()` at startup — no manual schema creation or file seeding needed on first deploy.
+`config/settings.py` raises `RuntimeError` at import time if `DATABASE_URL` is set but `APP_SECRET_KEY` is empty — production deployments fail fast rather than running with a weak secret.
 
----
-
-## Dead Code (keep until confirmed working on Railway)
-
-- `utils/gdrive.py` — Google Drive upload/download; replaced by Neon
-- `utils/gsheets.py` — Google Sheets helpers; not used
-
-Remove both files after confirming Railway deployment works end-to-end.
+The app calls `db.ensure_schema()` at startup — no manual schema creation needed on first deploy.
 
 ---
 
@@ -298,6 +305,6 @@ Remove both files after confirming Railway deployment works end-to-end.
 - `TW_INCLUDE_FROM` cutoff dates default to `None` (all history included). If you need to reset cost basis after fully selling and re-buying a ticker, set a cutoff date for that symbol in `utils/data_loader.py`.
 - `fetch_current_prices()` uses `fast_info.last_price` (intraday, ~15 min delay) then falls back to `history(period="5d")`. Yahoo Finance data for TW stocks may be unavailable outside market hours on some days.
 - Cathay Bank FX scraper silently falls back to yfinance if the page structure changes.
-- P&L history chart uses `current holdings × historical price` (not transaction-based running position) — acceptable for long-term ETF holds where position rarely changes.
+- P&L history chart uses `current holdings × historical price` — acceptable for long-term ETF holds where position rarely changes.
 - Neon free tier auto-suspends after 5 min idle; first login after idle has ~0.5–2s cold-start delay. Handled by `_with_conn` reconnect logic.
 - `ThreadedConnectionPool(maxconn=3)` is well below Neon's free-tier connection limit; raise if concurrent user count grows.

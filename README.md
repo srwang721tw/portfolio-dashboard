@@ -23,7 +23,8 @@ A personal Taiwan + US stock portfolio tracker built with Streamlit and backed b
 - **US cost basis in TWD** — entered as a fixed TWD amount (what you actually wired to your broker) to eliminate FX-drift noise from P&L charts
 - **TW sell-cost factor** — market values are discounted by `≈ 0.99860` (brokerage commission + ETF transaction tax) so displayed values reflect net liquidation proceeds
 - **Multi-file CSV upload** — upload multiple CSVs at once; TW rows are merged and deduped, US holdings use last-file-wins per symbol
-- **Zero-seeding deploys** — no Google Drive file seeding needed; `db.ensure_schema()` runs idempotently on every startup
+- **Zero-seeding deploys** — `db.ensure_schema()` runs idempotently on every startup; no manual DB migration needed
+- **Security** — PBKDF2-SHA256 auth, generic login errors (no username enumeration), 30-min session timeout, production secret key validation at startup
 
 ## Features
 
@@ -58,11 +59,7 @@ portfolio-dashboard/
 │   ├── history_manager.py   # Daily portfolio snapshot save/load
 │   ├── portfolio_calc.py    # Holdings enrichment, P&L, pledge ratio calculations
 │   └── price_fetcher.py     # yfinance wrappers for live + historical prices
-├── data/                    # Local sample CSVs only (gitignored for real data)
-│   ├── sample_tw_stocks.csv
-│   └── sample_us_stocks.csv
 ├── setup_db.py              # One-time: create DB schema (run before first deploy)
-├── migrate_to_neon.py       # One-time: migrate flat-file data into Neon
 ├── requirements.txt
 └── railway.toml
 ```
@@ -93,9 +90,11 @@ streamlit run app.py
 | Variable | Required | Description |
 |---|---|---|
 | `DATABASE_URL` | **Yes** | Neon PostgreSQL connection string (`postgresql://...?sslmode=require`) |
-| `APP_SECRET_KEY` | Yes | Random hex string for session security |
+| `APP_SECRET_KEY` | **Yes** | Random hex string for session security |
 
 > **Never commit `.env` or `DATABASE_URL` to git.** The `.env` file is gitignored.
+>
+> The app raises `RuntimeError` at startup if `DATABASE_URL` is set but `APP_SECRET_KEY` is empty, so production deployments fail fast rather than running with a weak secret. Generate one with: `python -c "import secrets; print(secrets.token_hex(32))"`
 
 ## Deploy to Railway
 
@@ -131,4 +130,4 @@ Maintenance Ratio = Pledged Stock Value / (Loan Principal + Accrued Interest) ×
 | 🟡 Watch | 200% – 300% |
 | 🟢 Safe | ≥ 300% |
 
-Interest can be entered manually per loan (overrides the auto-computed rate × days formula).
+Interest can be entered manually per loan (overrides the auto-computed rate × days formula). Stocks pledged without borrowing (zero-loan pledges) boost the overall ratio without blocking its display.

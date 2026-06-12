@@ -1,16 +1,15 @@
 import hashlib
 import hmac
-import io
+import logging
 import os
 import time
 from typing import Optional, Dict, Tuple
 
-import pyotp
-import qrcode
 import streamlit as st
 
-from config.settings import APP_NAME
 import utils.db as db
+
+_log = logging.getLogger(__name__)
 
 
 def _hash_password(password: str, salt: str) -> str:
@@ -24,23 +23,22 @@ def has_users() -> bool:
     return bool(db.list_usernames())
 
 
-def create_user(username: str, password: str,
-                totp_enabled: bool = True, email: str = "") -> Tuple[bool, Optional[str]]:
+def create_user(username: str, password: str, email: str = "") -> Tuple[bool, None]:
     if db.get_user(username) is not None:
         return False, None
     salt          = os.urandom(32).hex()
     password_hash = _hash_password(password, salt)
-    totp_secret   = pyotp.random_base32() if totp_enabled else None
     db.upsert_user(
         username=username,
         password_hash=password_hash,
         salt=salt,
-        totp_secret=totp_secret,
-        totp_enabled=totp_enabled,
+        totp_secret=None,
+        totp_enabled=False,
         email=email,
         created_at=time.time(),
     )
-    return True, totp_secret
+    _log.info("Account created: username=%s", username)
+    return True, None
 
 
 def update_profile(username: str,
@@ -54,42 +52,27 @@ def update_profile(username: str,
         db.update_user_password(username, password_hash, salt)
     if new_email is not None:
         db.update_user_email(username, new_email)
+    _log.info("Profile updated: username=%s", username)
     return True
 
 
 def get_profile(username: str) -> Dict:
     u = db.get_user(username) or {}
-    return {"email": u.get("email", ""), "totp_enabled": u.get("totp_enabled", False)}
+    return {"email": u.get("email", "")}
 
 
 def verify_password(username: str, password: str) -> bool:
     u = db.get_user(username)
     if u is None:
+        _log.warning("Failed login — unknown username: %s", username)
         return False
     expected = _hash_password(password, u["salt"])
-    return hmac.compare_digest(expected, u["password_hash"])
-
-
-def is_totp_enabled(username: str) -> bool:
-    return (db.get_user(username) or {}).get("totp_enabled", False)
-
-
-def verify_totp(username: str, code: str) -> bool:
-    u = db.get_user(username)
-    if u is None:
-        return False
-    if not u.get("totp_enabled"):
-        return True
-    return pyotp.TOTP(u["totp_secret"]).verify(code.strip(), valid_window=1)
-
-
-def get_totp_qr_bytes(username: str, secret: str) -> io.BytesIO:
-    uri = pyotp.TOTP(secret).provisioning_uri(name=username, issuer_name=APP_NAME)
-    img = qrcode.make(uri)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
+    result   = hmac.compare_digest(expected, u["password_hash"])
+    if result:
+        _log.info("Login: username=%s", username)
+    else:
+        _log.warning("Failed login — wrong password: username=%s", username)
+    return result
 
 
 def require_auth():
@@ -99,5 +82,5 @@ def require_auth():
 
 
 def logout():
-    for key in ["authenticated", "username"]:
+    for key in ["authenticated", "username", "_last_activity"]:
         st.session_state.pop(key, None)

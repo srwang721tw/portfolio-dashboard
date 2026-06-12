@@ -10,10 +10,18 @@ DATA_DIR.mkdir(exist_ok=True)
 
 APP_NAME = "投資組合儀表板"
 APP_ICON = "📈"
-APP_SECRET_KEY = os.getenv("APP_SECRET_KEY", "dev_secret_change_in_production")
 
-SAMPLE_TW_CSV = BASE_DIR / "data" / "sample_tw_stocks.csv"
-SAMPLE_US_CSV = BASE_DIR / "data" / "sample_us_stocks.csv"
+# Startup validation: fail fast in production if the secret key was never set.
+# DATABASE_URL being present is a reliable proxy for "this is a real deployment".
+APP_SECRET_KEY = os.getenv("APP_SECRET_KEY", "")
+_is_production = bool(os.getenv("DATABASE_URL", ""))
+if _is_production and not APP_SECRET_KEY:
+    raise RuntimeError(
+        "APP_SECRET_KEY must be set in production. "
+        "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+    )
+if not APP_SECRET_KEY:
+    APP_SECRET_KEY = "dev_secret_change_in_production"  # local dev only
 
 # Taiwan stock symbols (yfinance needs .TW suffix)
 TW_TICKERS = {
@@ -28,33 +36,21 @@ US_TICKERS = {
     "VT": "VT",
 }
 
-PRICE_CACHE_TTL = 300       # 5 minutes (matches auto-refresh interval)
+PRICE_CACHE_TTL = 300       # 5 minutes
 HISTORY_CACHE_TTL = 3600    # 1 hour
 
-# Default US TWD cost basis — 0 means "not set".
-# The real value is stored in data/us_cost_config.json (synced from Google Drive)
-# and edited via the dashboard UI.  Never hardcode a real amount here.
+# Default US TWD cost basis (0 = not set; real value stored per-user in DB).
 US_TWD_COST_BASIS = 0
 
-# Pledge thresholds
-PLEDGE_CRITICAL = 140.0     # Margin call
-PLEDGE_WARNING = 200.0      # Warning
-PLEDGE_SAFE = 300.0         # Safe zone
+# Pledge maintenance ratio thresholds (%)
+PLEDGE_CRITICAL = 140.0
+PLEDGE_WARNING  = 200.0
+PLEDGE_SAFE     = 300.0
 
-# Colors
+# Chart colours
 COLOR_POSITIVE = "#00C896"
 COLOR_NEGATIVE = "#FF4B5C"
-COLOR_NEUTRAL = "#4A90D9"
-COLOR_WARNING = "#FFB74D"
+COLOR_NEUTRAL  = "#4A90D9"
+COLOR_WARNING  = "#FFB74D"
 COLOR_CRITICAL = "#FF4B5C"
-COLOR_PURPLE = "#A855F7"
-
-PLOTLY_LAYOUT = dict(
-    paper_bgcolor="rgba(0,0,0,0)",
-    plot_bgcolor="rgba(0,0,0,0)",
-    font=dict(color="#E6EDF3", family="sans-serif"),
-    xaxis=dict(gridcolor="#30363D", zerolinecolor="#30363D"),
-    yaxis=dict(gridcolor="#30363D", zerolinecolor="#30363D"),
-    margin=dict(l=10, r=10, t=40, b=10),
-    legend=dict(bgcolor="rgba(0,0,0,0)"),
-)
+COLOR_PURPLE   = "#A855F7"

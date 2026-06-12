@@ -3,6 +3,7 @@ Portfolio Dashboard — personal Taiwan + US stock tracker.
 All UI text is in English to keep a low profile.
 """
 import json
+import time
 import streamlit as st
 import altair as alt
 import pandas as pd
@@ -26,7 +27,7 @@ from utils.data_loader import (
     load_tw_holdings, load_us_holdings,
     load_pledge_config, save_pledge_config,
     load_us_cost_twd, save_us_cost_twd,
-    _read_csv_bytes, _is_dazhangdan, _is_fuzhuotuo,
+    _read_csv, _is_dazhangdan, _is_fuzhuotuo,
     _parse_dazhangdan_rows, _parse_fuzhuotuo,
     validate_csv_upload,
 )
@@ -38,6 +39,7 @@ from utils.price_fetcher import (
 from utils.portfolio_calc import (
     enrich_holdings, portfolio_summary,
     compute_portfolio_history, compute_pledge_ratio,
+    _compute_loan_interest,
 )
 from utils.history_manager import save_snapshot
 
@@ -139,16 +141,13 @@ def dc(v):
 # ── Cached history helper (hashable args via JSON) ────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def _cached_history(tw_json: str, us_json: str, days: int,
-                    tw_txn_json: str = "[]",
                     us_cost_twd: float = 0.0) -> pd.DataFrame:
-    tw_h   = json.loads(tw_json)
-    us_h   = json.loads(us_json)
-    tw_txn = json.loads(tw_txn_json)
-    tw_ph  = {h["symbol"]: fetch_historical_prices(h["symbol"], days) for h in tw_h}
-    us_ph  = {h["symbol"]: fetch_historical_prices(h["symbol"], days) for h in us_h}
-    usd_h  = fetch_usd_twd_history(days)
+    tw_h  = json.loads(tw_json)
+    us_h  = json.loads(us_json)
+    tw_ph = {h["symbol"]: fetch_historical_prices(h["symbol"], days) for h in tw_h}
+    us_ph = {h["symbol"]: fetch_historical_prices(h["symbol"], days) for h in us_h}
+    usd_h = fetch_usd_twd_history(days)
     return compute_portfolio_history(tw_h, us_h, tw_ph, us_ph, usd_h, days,
-                                     tw_transactions=tw_txn,
                                      us_cost_twd=us_cost_twd)
 
 
@@ -172,8 +171,6 @@ def show_auth():
             pw    = st.text_input("Password", type="password")
             ok    = st.form_submit_button("Sign In", use_container_width=True, type="primary")
         if ok:
-            if not has_users():
-                st.error("No accounts found. Please create one first."); return
             if not verify_password(uname, pw):
                 st.error("Invalid username or password"); return
             st.session_state.authenticated = True
@@ -197,7 +194,7 @@ def show_auth():
                 st.error("Password must be at least 8 characters"); return
             if pw2a != pw2b:
                 st.error("Passwords do not match"); return
-            success, _ = create_user(uname2, pw2a, totp_enabled=False, email=email2)
+            success, _ = create_user(uname2, pw2a, email=email2)
             if not success:
                 st.error("Username already exists"); return
             st.success(f"✅ Account **{uname2}** created! Please sign in.")
@@ -422,7 +419,32 @@ def _chart_pledge_gauge(ratio: float):
 # ═════════════════════════════════════════════════════════════════════════════
 # DASHBOARD
 # ═════════════════════════════════════════════════════════════════════════════
+def _apply_us_cost_override(us_enriched: list, us_cost_twd: float) -> None:
+    """Redistribute a fixed TWD cost basis proportionally across US holdings (in-place)."""
+    if us_cost_twd <= 0:
+        return
+    _us_usd_total = sum(h["cost_basis"] or 0 for h in us_enriched)
+    if _us_usd_total <= 0:
+        return
+    for h in us_enriched:
+        frac                    = (h["cost_basis"] or 0) / _us_usd_total
+        h["cost_basis_twd"]     = us_cost_twd * frac
+        h["unrealized_pnl_twd"] = (h["market_value_twd"] or 0) - h["cost_basis_twd"]
+        h["pnl_pct"] = (
+            h["unrealized_pnl_twd"] / h["cost_basis_twd"] * 100
+            if h["cost_basis_twd"] > 0 else 0.0
+        )
+
+
 def render_dashboard():
+    # 30-minute inactivity timeout
+    _now = time.time()
+    if _now - st.session_state.get("_last_activity", _now) > 1800:
+        logout()
+        st.info("Session expired. Please sign in again.")
+        st.rerun()
+    st.session_state._last_activity = _now
+
     username  = st.session_state.username
     _has_data = db.has_user_data(username)
 
@@ -467,19 +489,7 @@ def render_dashboard():
             us_e = enrich_holdings(us_h, prices, usd_twd)
 
             # Override US cost basis with actual TWD invested
-            if _us_cost_twd > 0:
-                _us_usd_total = sum(h["cost_basis"] or 0 for h in us_e)
-                if _us_usd_total > 0:
-                    for h in us_e:
-                        _frac               = (h["cost_basis"] or 0) / _us_usd_total
-                        h["cost_basis_twd"] = _us_cost_twd * _frac
-                        h["unrealized_pnl_twd"] = (
-                            (h["market_value_twd"] or 0) - h["cost_basis_twd"]
-                        )
-                        h["pnl_pct"] = (
-                            h["unrealized_pnl_twd"] / h["cost_basis_twd"] * 100
-                            if h["cost_basis_twd"] > 0 else 0.0
-                        )
+            _apply_us_cost_override(us_e, _us_cost_twd)
 
             summary = portfolio_summary(tw_e, us_e)
 
@@ -728,15 +738,12 @@ def _section_pnl_history(tw_h, us_h, us_cost_twd: float):
     tw_json  = json.dumps(tw_h)
     us_json  = json.dumps(us_h)
     _us_cost = float(us_cost_twd)
-    # Always use current holdings × historical price (long-term buy-and-hold):
-    # pass empty transactions so compute_portfolio_history uses the simple fallback path.
-    _txn_json = "[]"
 
     h1, h2, h3 = st.tabs(["📅 Daily (30d)", "📆 Monthly (This Year)", "📊 Annual (3Y)"])
 
     with h1:
         with st.spinner("Loading price history…"):
-            df60 = _cached_history(tw_json, us_json, 60, _txn_json, _us_cost)
+            df60 = _cached_history(tw_json, us_json, 60, _us_cost)
         if df60.empty:
             st.info("No data yet."); return
 
@@ -751,7 +758,7 @@ def _section_pnl_history(tw_h, us_h, us_cost_twd: float):
     with h2:
         with st.spinner("Loading monthly data…"):
             this_year = datetime.now(_TZ8).year
-            df_yr     = _cached_history(tw_json, us_json, 365, _txn_json, _us_cost)
+            df_yr     = _cached_history(tw_json, us_json, 365, _us_cost)
         if df_yr.empty:
             st.info("No data yet."); return
         # Monthly P&L change = end-of-month P&L level minus previous month-end level
@@ -768,7 +775,7 @@ def _section_pnl_history(tw_h, us_h, us_cost_twd: float):
 
     with h3:
         with st.spinner("Loading 3-year history (first load may take ~10 s)…"):
-            df3y = _cached_history(tw_json, us_json, 1095, _txn_json, _us_cost)
+            df3y = _cached_history(tw_json, us_json, 1095, _us_cost)
         if df3y.empty:
             st.info("No data yet."); return
         # Annual P&L change = end-of-year P&L level minus previous year-end level
@@ -830,18 +837,6 @@ def _date_to_str(v) -> str:
         return s if len(s) == 10 else ""
     except Exception:
         return ""
-
-
-def _compute_loan_interest(loan_twd: float, rate: float, start_date: str) -> float:
-    """Compute interest: principal × rate% × days_elapsed / 365."""
-    if rate > 0 and start_date and loan_twd > 0:
-        try:
-            from datetime import date as _d
-            days = max(0, (_d.today() - _d.fromisoformat(start_date)).days)
-            return loan_twd * rate / 100 * days / 365
-        except Exception:
-            pass
-    return 0.0
 
 
 def _loans_to_df(loans) -> pd.DataFrame:
@@ -1091,7 +1086,7 @@ def _tab_upload():
                 if not ok:
                     errors.append(err); continue
                 buf.seek(0)
-                df = _read_csv_bytes(buf)
+                df = _read_csv(buf)
                 if df is None or not _is_dazhangdan(df):
                     errors.append(
                         f"{f.name}：格式不符（需含欄位：股名、日期、成交股數、淨收付）"
@@ -1140,7 +1135,7 @@ def _tab_upload():
                 if not ok:
                     errors.append(err); continue
                 buf.seek(0)
-                df = _read_csv_bytes(buf)
+                df = _read_csv(buf)
                 if df is None or not _is_fuzhuotuo(df):
                     errors.append(
                         f"{f.name}：格式不符（需含欄位：代號、目前庫存、均價）"
@@ -1187,7 +1182,11 @@ def _tab_upload():
 # ═════════════════════════════════════════════════════════════════════════════
 
 # Ensure DB schema exists on startup (idempotent; fast after first call).
-db.ensure_schema()
+try:
+    db.ensure_schema()
+except Exception:
+    st.error("Database unavailable. Please try again in a moment.")
+    st.stop()
 
 if not st.session_state.get("authenticated"):
     show_auth()

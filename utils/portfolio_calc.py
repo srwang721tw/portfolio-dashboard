@@ -1,60 +1,35 @@
 from typing import Dict, List, Optional, Tuple
+from datetime import date as _date
 import pandas as pd
-import numpy as np
 
 
-def _tw_running_frame(sym: str, price_history: pd.DataFrame,
-                      txn_df: pd.DataFrame) -> Optional[pd.DataFrame]:
+def _strip_tz(index) -> pd.DatetimeIndex:
+    """Normalize a DatetimeIndex to tz-naive date-only (strips time and timezone)."""
+    idx = pd.to_datetime(index).normalize()
+    return idx.tz_localize(None) if idx.tz is not None else idx
+
+
+def _compute_loan_interest(
+    principal: float,
+    rate_pct: float,
+    start_date: str,
+    override: Optional[float] = None,
+) -> float:
     """
-    Compute per-symbol TW P&L using the actual running position from transactions.
-
-    At each price date we use:
-      - shares_at_date  = cumulative sum of share_delta up to that date
-      - cost_at_date    = cumulative sum of cost_flow  up to that date
-      - pnl_at_date     = shares_at_date * price - cost_at_date
-
-    Returns a DataFrame indexed by price dates with columns
-    {sym}_val, {sym}_cost, {sym}_pnl — or None if no transactions for this symbol.
+    Return accrued interest in TWD.
+    If override is set, return it directly.
+    Otherwise compute: principal × rate% × days_elapsed / 365.
     """
-    sym_txns = txn_df[txn_df['symbol'] == sym].copy()
-    if sym_txns.empty:
-        return None
-
-    sym_txns['date'] = pd.to_datetime(sym_txns['date']).dt.normalize()
-
-    # Daily cumulative position
-    daily = sym_txns.groupby('date').agg({'share_delta': 'sum', 'cost_flow': 'sum'})
-    cum   = daily.cumsum()
-
-    # Clean price series — strip tz so we can compare with tz-naive tx dates
-    prices = price_history.iloc[:, 0].copy()
-    prices.index = pd.to_datetime(prices.index).normalize()
-    if prices.index.tz is not None:
-        prices.index = prices.index.tz_localize(None)
-    prices = prices[~prices.index.duplicated(keep='last')].sort_index()
-
-    if prices.empty or cum.empty:
-        return None
-    if cum.index.min() > prices.index.max():
-        return None  # all transactions are in the future relative to price window
-
-    # Build a full daily index so forward-fill works across weekends/holidays
-    start    = min(cum.index.min(), prices.index.min())
-    full_idx = pd.date_range(start=start, end=prices.index.max(), freq='D')
-
-    cum_full     = cum.reindex(full_idx).ffill().fillna(0)
-    cum_at_price = cum_full.reindex(prices.index).ffill().fillna(0)
-
-    mask = cum_at_price['share_delta'] > 0
-    if not mask.any():
-        return None
-
-    result = pd.DataFrame(index=prices.index[mask])
-    result[f'{sym}_val']  = (prices[mask].values
-                              * cum_at_price.loc[mask, 'share_delta'].values)
-    result[f'{sym}_cost'] = cum_at_price.loc[mask, 'cost_flow'].values
-    result[f'{sym}_pnl']  = result[f'{sym}_val'] - result[f'{sym}_cost']
-    return result
+    if override is not None:
+        return float(override)
+    if rate_pct > 0 and start_date and principal > 0:
+        try:
+            start        = _date.fromisoformat(start_date)
+            days_elapsed = max(0, (_date.today() - start).days)
+            return principal * rate_pct / 100 * days_elapsed / 365
+        except Exception:
+            pass
+    return 0.0
 
 
 def enrich_holdings(
@@ -135,15 +110,15 @@ def compute_portfolio_history(
     us_price_history: Dict[str, pd.DataFrame],
     usd_twd_history: pd.Series,
     days: int = 180,
-    tw_transactions: Optional[List[Dict]] = None,
     us_cost_twd: float = 0.0,
 ) -> pd.DataFrame:
     """
     Compute daily portfolio value and unrealized P&L from historical prices.
 
-    tw_transactions: if provided, TW stocks use actual running position from transactions.
+    Uses current holdings × historical price for all symbols.
+
     us_cost_twd: if > 0, use this fixed TWD amount as the total US cost basis
-                 (the actual TWD invested), distributed proportionally by USD cost.
+                 (the actual TWD wired to broker), distributed proportionally by USD cost.
                  This prevents FX fluctuations from distorting the US cost line.
 
     Returns DataFrame with columns: date, total_value_twd, total_cost_twd, total_pnl_twd,
@@ -151,30 +126,12 @@ def compute_portfolio_history(
     """
     frames = []
 
-    # Build transaction DataFrame once (if available)
-    txn_df: Optional[pd.DataFrame] = None
-    if tw_transactions:
-        txn_df = pd.DataFrame(tw_transactions)
-        if txn_df.empty or 'symbol' not in txn_df.columns:
-            txn_df = None
-
     for h in tw_holdings:
         sym = h["symbol"]
         if sym not in tw_price_history or tw_price_history[sym].empty:
             continue
-
-        # ── Transaction-based running position ──────────────────────────────
-        if txn_df is not None:
-            frame = _tw_running_frame(sym, tw_price_history[sym], txn_df)
-            if frame is not None:
-                frames.append(frame)
-                continue
-
-        # ── Fallback: current holdings × historical price ────────────────────
         df = tw_price_history[sym].copy()
-        df.index = pd.to_datetime(df.index).normalize()
-        if df.index.tz is not None:
-            df.index = df.index.tz_localize(None)
+        df.index = _strip_tz(df.index)
         df.columns = [sym]
         df["value"] = df[sym] * h["shares"]
         df["cost"] = h["shares"] * h["cost_per_share"]
@@ -185,11 +142,8 @@ def compute_portfolio_history(
 
     # Pre-compute FX series once (tz-stripped)
     usd_idx = usd_twd_history.copy()
-    usd_idx.index = pd.to_datetime(usd_idx.index).normalize()
-    if usd_idx.index.tz is not None:
-        usd_idx.index = usd_idx.index.tz_localize(None)
+    usd_idx.index = _strip_tz(usd_idx.index)
 
-    # Total US USD cost for proportional distribution of us_cost_twd
     _us_usd_total = sum(h["shares"] * h["cost_per_share"] for h in us_holdings)
 
     for h in us_holdings:
@@ -197,18 +151,15 @@ def compute_portfolio_history(
         if sym not in us_price_history or us_price_history[sym].empty:
             continue
         df = us_price_history[sym].copy()
-        df.index = pd.to_datetime(df.index).normalize()
-        if df.index.tz is not None:
-            df.index = df.index.tz_localize(None)
+        df.index = _strip_tz(df.index)
         df.columns = [sym]
 
         fx = usd_idx.reindex(df.index, method="ffill").fillna(32.0)
         df["value"] = df[sym] * h["shares"] * fx
 
         if us_cost_twd > 0 and _us_usd_total > 0:
-            # Fixed TWD cost: proportional share of the actual TWD invested
             frac       = (h["shares"] * h["cost_per_share"]) / _us_usd_total
-            df["cost"] = us_cost_twd * frac   # constant; not affected by FX drift
+            df["cost"] = us_cost_twd * frac
         else:
             df["cost"] = h["shares"] * h["cost_per_share"] * fx
 
@@ -221,23 +172,22 @@ def compute_portfolio_history(
         return pd.DataFrame()
 
     combined = pd.concat(frames, axis=1)
-    # Forward-fill so that market-closure days (e.g. TW holiday when US is open)
-    # carry the previous close instead of NaN — prevents those days from being
-    # omitted from the portfolio total when summing across symbols.
+    # Forward-fill so that market-closure days carry the previous close instead
+    # of NaN — prevents those days from being omitted from the portfolio total.
     combined = combined.ffill()
     combined = combined.dropna(how="all")
 
-    val_cols = [c for c in combined.columns if c.endswith("_val")]
+    val_cols  = [c for c in combined.columns if c.endswith("_val")]
     cost_cols = [c for c in combined.columns if c.endswith("_cost")]
-    pnl_cols = [c for c in combined.columns if c.endswith("_pnl")]
+    pnl_cols  = [c for c in combined.columns if c.endswith("_pnl")]
 
     result = pd.DataFrame(index=combined.index)
-    result["total_value_twd"] = combined[val_cols].sum(axis=1)
-    result["total_cost_twd"] = combined[cost_cols].sum(axis=1)
-    result["total_pnl_twd"] = combined[pnl_cols].sum(axis=1)
-    result["pnl_pct"] = result["total_pnl_twd"] / result["total_cost_twd"] * 100
+    result["total_value_twd"]  = combined[val_cols].sum(axis=1)
+    result["total_cost_twd"]   = combined[cost_cols].sum(axis=1)
+    result["total_pnl_twd"]    = combined[pnl_cols].sum(axis=1)
+    result["pnl_pct"]          = result["total_pnl_twd"] / result["total_cost_twd"] * 100
     result["daily_pnl_change"] = result["total_pnl_twd"].diff()
-    result.index = pd.to_datetime(result.index).normalize()  # strip tz, keep date only
+    result.index = _strip_tz(result.index)
     result.index.name = "date"
     result = result.sort_index().tail(days)
 
@@ -261,8 +211,6 @@ def compute_pledge_ratio(
                       instead of computing from rate/days (manual input mode).
     pledged_stocks: [{"symbol": ..., "shares": ..., "currency": "TWD"|"USD"}]
     """
-    from datetime import date as _date
-
     total_value = 0.0
     for ps in pledged_stocks:
         price = prices.get(ps["symbol"])
@@ -271,19 +219,7 @@ def compute_pledge_ratio(
         fx = usd_twd if ps.get("currency") == "USD" else 1.0
         total_value += ps["shares"] * price * fx
 
-    # Interest: manual override takes priority; otherwise compute from rate/days
-    if override_accrued is not None:
-        accrued = float(override_accrued)
-    elif interest_rate > 0 and start_date and loan_twd > 0:
-        try:
-            start        = _date.fromisoformat(start_date)
-            days_elapsed = max(0, (_date.today() - start).days)
-            accrued      = loan_twd * interest_rate / 100 * days_elapsed / 365
-        except Exception:
-            accrued = 0.0
-    else:
-        accrued = 0.0
-
+    accrued       = _compute_loan_interest(loan_twd, interest_rate, start_date, override_accrued)
     total_liability = loan_twd + accrued
     if total_liability <= 0:
         return None, total_value, accrued
