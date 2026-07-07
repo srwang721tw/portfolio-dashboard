@@ -114,6 +114,7 @@ def _parse_dazhangdan_rows(df: pd.DataFrame) -> List[Dict]:
     """
     try:
         df = df.copy()
+        df = df.drop_duplicates()   # remove exact duplicate rows within this CSV
         df.columns = df.columns.str.strip()
         df['股名'] = df['股名'].str.strip()
         df['代號'] = df['股名'].map(TW_NAME_TO_TICKER)
