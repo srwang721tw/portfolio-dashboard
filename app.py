@@ -1103,14 +1103,19 @@ def _tab_upload():
                     st.error(e)
 
             if all_rows:
-                # Dedup by (symbol, trade_date, share_delta, cost_flow)
-                seen, deduped = set(), []
-                for r in all_rows:
-                    key = (r["symbol"], r["trade_date"],
-                           round(r["share_delta"], 4), round(r["cost_flow"], 4))
-                    if key not in seen:
-                        seen.add(key)
-                        deduped.append(r)
+                # Only dedup when multiple files are uploaded — single file data
+                # is trusted as-is to avoid dropping legitimately identical transactions
+                # (e.g. two separate buy orders on the same day at the same price).
+                if len(up_tw_files) > 1:
+                    seen, deduped = set(), []
+                    for r in all_rows:
+                        key = (r["symbol"], r["trade_date"],
+                               round(r["share_delta"], 4), round(r["cost_flow"], 4))
+                        if key not in seen:
+                            seen.add(key)
+                            deduped.append(r)
+                else:
+                    deduped = all_rows
                 db.replace_tw_transactions(username, deduped)
                 st.cache_data.clear()
                 st.success(
