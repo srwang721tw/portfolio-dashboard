@@ -163,31 +163,42 @@ def _parse_dazhangdan_rows(df: pd.DataFrame) -> List[Dict]:
 
 def _aggregate_tw_transactions(rows: List[Dict]) -> List[Dict]:
     """
-    Aggregate raw transaction rows into net holdings.
+    Aggregate raw transaction rows into net holdings using weighted average cost (WAC).
+
     Input:  [{symbol, name, trade_date, share_delta, cost_flow}]
     Output: [{symbol, name, shares, cost_per_share, currency}]
+
+    For sells, cost removed = shares_sold × running_avg_cost (not actual sell proceeds).
+    This keeps the remaining cost basis accurate regardless of realised P&L.
     """
-    groups: Dict[str, Dict] = {}
+    state: Dict[str, Dict] = {}
     name_map: Dict[str, str] = {}
-    for r in rows:
+
+    for r in sorted(rows, key=lambda r: r['trade_date']):
         sym = r['symbol']
-        if sym not in groups:
-            groups[sym] = {'share_delta': 0.0, 'cost_flow': 0.0}
-        groups[sym]['share_delta'] += r['share_delta']
-        groups[sym]['cost_flow']   += r['cost_flow']
+        if sym not in state:
+            state[sym] = {'shares': 0.0, 'cost': 0.0}
+        s = state[sym]
         name_map[sym] = r.get('name', sym)
 
+        if r['share_delta'] > 0:
+            s['shares'] += r['share_delta']
+            s['cost']   += r['cost_flow']
+        else:
+            shares_sold = -r['share_delta']
+            avg = s['cost'] / s['shares'] if s['shares'] > 0 else 0.0
+            s['shares'] -= shares_sold
+            s['cost']   -= shares_sold * avg
+
     holdings = []
-    for sym, agg in groups.items():
-        net_shares = agg['share_delta']
-        net_cost   = agg['cost_flow']
-        if net_shares <= 0 or net_cost <= 0:
+    for sym, s in state.items():
+        if s['shares'] <= 0 or s['cost'] <= 0:
             continue
         holdings.append({
             'symbol':         sym,
             'name':           name_map.get(sym, sym),
-            'shares':         int(net_shares),
-            'cost_per_share': round(net_cost / net_shares, 4),
+            'shares':         int(s['shares']),
+            'cost_per_share': round(s['cost'] / s['shares'], 4),
             'currency':       'TWD',
         })
     return holdings
