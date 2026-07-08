@@ -1078,8 +1078,8 @@ def _tab_upload():
             "TW CSV", type=["csv"], key="up_tw", accept_multiple_files=True
         )
         if up_tw_files:
-            all_rows = []
-            errors   = []
+            rows_per_file = []
+            errors        = []
             for f in up_tw_files:
                 buf  = io.BytesIO(f.getvalue())
                 ok, err = validate_csv_upload(buf, f.name)
@@ -1096,31 +1096,38 @@ def _tab_upload():
                 if not rows:
                     errors.append(f"{f.name}：無符合條件的交易資料")
                     continue
-                all_rows.extend(rows)
+                rows_per_file.append(rows)
 
             if errors:
                 for e in errors:
                     st.error(e)
 
-            if all_rows:
-                # Only dedup when multiple files are uploaded — single file data
-                # is trusted as-is to avoid dropping legitimately identical transactions
-                # (e.g. two separate buy orders on the same day at the same price).
-                if len(up_tw_files) > 1:
-                    seen, deduped = set(), []
-                    for r in all_rows:
-                        key = (r["symbol"], r["trade_date"],
-                               round(r["share_delta"], 4), round(r["cost_flow"], 4))
-                        if key not in seen:
-                            seen.add(key)
-                            deduped.append(r)
+            if rows_per_file:
+                if len(rows_per_file) > 1:
+                    # Cross-file dedup only: a row is dropped only if the same
+                    # (symbol, date, shares, cost) key already appeared in a
+                    # PREVIOUS file. Identical keys within the same file are kept
+                    # because they represent legitimate separate orders.
+                    seen_from_prev: set = set()
+                    deduped = []
+                    for file_rows in rows_per_file:
+                        for r in file_rows:
+                            key = (r["symbol"], r["trade_date"],
+                                   round(r["share_delta"], 4), round(r["cost_flow"], 4))
+                            if key not in seen_from_prev:
+                                deduped.append(r)
+                        for r in file_rows:
+                            seen_from_prev.add((r["symbol"], r["trade_date"],
+                                                round(r["share_delta"], 4),
+                                                round(r["cost_flow"], 4)))
                 else:
-                    deduped = all_rows
+                    deduped = rows_per_file[0]
                 db.replace_tw_transactions(username, deduped)
                 st.cache_data.clear()
                 st.success(
                     f"✅ 已匯入 {len(deduped)} 筆交易紀錄"
-                    + (f"（來自 {len(up_tw_files)} 個檔案，去重後）" if len(up_tw_files) > 1 else "")
+                    + (f"（來自 {len(rows_per_file)} 個檔案，跨檔去重後）"
+                       if len(rows_per_file) > 1 else "")
                 )
                 st.rerun()
 
